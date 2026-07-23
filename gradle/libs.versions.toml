@@ -1,0 +1,25 @@
+# Gradle Version Catalog 统一依赖与版本管理清单文件
+
+[versions]
+guava = "33.5.0-jre"
+junit-jupiter-engine = "6.0.1"
+jadx = "1.5.6"
+gson = "2.10.1"
+logback = "1.5.17"
+shadow = "8.3.3"
+mcp = "0.14.0"
+
+[libraries]
+guava = { module = "com.google.guava:guava", version.ref = "guava" }
+junit-jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine", version.ref = "junit-jupiter-engine" }
+jadx-core = { module = "io.github.skylot:jadx-core", version.ref = "jadx" }
+jadx-dex-input = { module = "io.github.skylot:jadx-dex-input", version.ref = "jadx" }
+jadx-java-input = { module = "io.github.skylot:jadx-java-input", version.ref = "jadx" }
+jadx-smali-input = { module = "io.github.skylot:jadx-smali-input", version.ref = "jadx" }
+gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
+logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
+mcp-kotlin-sdk = { module = "io.modelcontextprotocol:kotlin-sdk", version.ref = "mcp" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version = "2.3.21" }
+shadow = { id = "com.github.johnrengelman.shadow", version.ref = "shadow" }

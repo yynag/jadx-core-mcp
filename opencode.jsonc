@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "jadx": {
+      "type": "local",
+      "command": ["java", "-jar", "/path/to/jadx-core-mcp/app/build/libs/app-all.jar", "--mcp"],
+      "enabled": true
+    }
+  }
+}
