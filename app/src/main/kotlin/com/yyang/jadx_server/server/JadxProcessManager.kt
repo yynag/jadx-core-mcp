@@ -41,9 +41,58 @@ class JadxProcessManager {
     }
 
     /**
-     * Dynamically load a new APK and generate a UUID identifier.
+     * 根据文件大小及外部输入/环境变量动态计算 JVM -Xmx 堆内存上限。
+     * 依据：JADX load() 阶段需要构建全量 ClassNode 及全局 XRef 引用链，大型 APK 产生数百万节点，内存消耗与文件体积成正比。
      */
-    fun loadApk(apkPath: String): Map<String, Any> {
+    private fun calculateMaxHeap(file: File, requestedMaxHeap: String?): String {
+        if (!requestedMaxHeap.isNullOrBlank()) {
+            return if (requestedMaxHeap.startsWith("-Xmx")) requestedMaxHeap else "-Xmx$requestedMaxHeap"
+        }
+        val envXmx = System.getenv("JADX_WORKER_XMX")
+        if (!envXmx.isNullOrBlank()) {
+            return if (envXmx.startsWith("-Xmx")) envXmx else "-Xmx$envXmx"
+        }
+        val sizeMb = file.length() / (1024 * 1024)
+        return when {
+            sizeMb < 20 -> "-Xmx2g"
+            sizeMb < 50 -> "-Xmx4g"
+            sizeMb < 100 -> "-Xmx6g"
+            else -> "-Xmx8g"
+        }
+    }
+
+    /**
+     * 根据 APK 文件体积动态计算健康检查超时时长（单位：毫秒）。
+     */
+    private fun calculateTimeoutMs(file: File): Long {
+        val envSec = System.getenv("JADX_WORKER_TIMEOUT_SEC")?.toLongOrNull()
+        if (envSec != null && envSec > 0) {
+            return envSec * 1000L
+        }
+        val sizeMb = file.length() / (1024 * 1024)
+        val calculatedSec = 60L + (sizeMb / 10L) * 30L
+        return calculatedSec.coerceAtLeast(60L).coerceAtMost(600L) * 1000L
+    }
+
+    /**
+     * 辅助函数：读取指定 Worker 日志文件的末尾若干行，用于崩溃诊断。
+     */
+    private fun readTailLog(logFile: File, linesCount: Int = 15): String {
+        if (!logFile.exists()) return "Log file does not exist."
+        return try {
+            val lines = logFile.readLines()
+            lines.takeLast(linesCount).joinToString("\n")
+        } catch (e: Exception) {
+            "Failed to read log: ${e.message}"
+        }
+    }
+
+    /**
+     * Dynamically load a new APK and generate a UUID identifier.
+     * @param apkPath Target APK file absolute path.
+     * @param maxHeap Optional explicit JVM max heap setting (e.g., "4g", "8g"). If omitted, calculated dynamically.
+     */
+    fun loadApk(apkPath: String, maxHeap: String? = null): Map<String, Any> {
         val file = File(apkPath)
         if (!file.exists()) {
             throw IllegalArgumentException("Target APK file not found at path: $apkPath")
@@ -56,10 +105,13 @@ class JadxProcessManager {
             val port = findAvailablePort()
             val masterPid = ProcessHandle.current().pid()
 
-            println("[ProcessManager] Creating isolated Worker process for $apkPath (apk_id: $apkId, assigned port: $port)...")
+            val xmxArg = calculateMaxHeap(file, maxHeap)
+            val timeoutMs = calculateTimeoutMs(file)
+            println("[ProcessManager] Creating isolated Worker process for $apkPath (apk_id: $apkId, assigned port: $port, heap: $xmxArg, timeout: ${timeoutMs / 1000}s)...")
 
             val pb = ProcessBuilder(
                 javaBin,
+                xmxArg,
                 "-cp", classPath,
                 "com.yyang.jadx_server.worker.JadxWorkerMainKt",
                 "--apk", apkPath,
@@ -70,7 +122,7 @@ class JadxProcessManager {
             if (!logDir.exists()) {
                 logDir.mkdirs()
             }
-            val workerLogFile = File(logDir, "worker.log")
+            val workerLogFile = File(logDir, "worker_$apkId.log")
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(workerLogFile))
             pb.redirectError(ProcessBuilder.Redirect.appendTo(workerLogFile))
 
@@ -85,9 +137,16 @@ class JadxProcessManager {
             // Health check polling until Worker is ready
             val startTime = System.currentTimeMillis()
             var isReady = false
-            while (System.currentTimeMillis() - startTime < 60000) {
+            while (System.currentTimeMillis() - startTime < timeoutMs) {
                 if (!proc.isAlive) {
-                    throw IllegalStateException("Worker sub-process (apk_id: $apkId) exited unexpectedly during startup.")
+                    val exitCode = proc.exitValue()
+                    val tailLog = readTailLog(workerLogFile)
+                    val errorReason = if (exitCode == 137 || exitCode == 9) {
+                        "Worker process killed by OS (Out Of Memory / Exit Code $exitCode). Heap setting: $xmxArg. Try specifying a larger max_heap parameter."
+                    } else {
+                        "Worker process exited unexpectedly with Exit Code $exitCode."
+                    }
+                    throw IllegalStateException("Worker sub-process (apk_id: $apkId) failed during startup: $errorReason\n--- Tail Logs ---\n$tailLog")
                 }
                 try {
                     val req = HttpRequest.newBuilder()
@@ -107,8 +166,10 @@ class JadxProcessManager {
             }
 
             if (!isReady) {
+                val isAlive = proc.isAlive
                 proc.destroyForcibly()
-                throw IllegalStateException("Worker sub-process (apk_id: $apkId) failed health check within 60 seconds.")
+                val tailLog = readTailLog(workerLogFile)
+                throw IllegalStateException("Worker sub-process (apk_id: $apkId) failed health check within ${timeoutMs / 1000} seconds (wasAlive: $isAlive).\n--- Tail Logs ---\n$tailLog")
             }
 
             instance.isReady = true

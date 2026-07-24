@@ -63,7 +63,7 @@ java {
 
 application {
     // Specify CLI application main class entrypoint
-    mainClass = "com.yyang.jadx_server.MainKt"
+    mainClass.set("com.yyang.jadx_server.MainKt")
 }
 
 tasks.named<Test>("test") {

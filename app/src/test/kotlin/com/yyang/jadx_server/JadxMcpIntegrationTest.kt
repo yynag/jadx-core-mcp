@@ -124,6 +124,21 @@ class JadxMcpIntegrationTest {
 
     @Test
     @Order(5)
+    fun testLoadApkWithCustomMaxHeap() {
+        // 验证显示传递 maxHeap 参数（如 "1g"）时，ProcessManager 能够成功拉起 isolated Worker
+        val result = processManager.loadApk(testApkPath, maxHeap = "1g")
+        assertEquals("success", result["status"])
+        val customApkId = result["apk_id"].toString()
+        assertTrue(customApkId.isNotBlank())
+        assertTrue(processManager.isWorkerAlive(customApkId))
+
+        // 卸载回收该测试 Worker 进程
+        val unloadRes = processManager.unloadApk(customApkId, clearCache = true)
+        assertEquals("success", unloadRes["status"])
+    }
+
+    @Test
+    @Order(6)
     fun testUnloadApkForMcp() {
         val result = processManager.unloadApk(apkId, clearCache = true)
         assertEquals("success", result["status"])

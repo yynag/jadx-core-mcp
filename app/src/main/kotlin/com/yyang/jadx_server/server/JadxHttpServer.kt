@@ -55,12 +55,13 @@ class JadxHttpServer(private val port: Int) {
             try {
                 val params = ResponseUtils.parseRequestParams(exchange)
                 val apkPath = params["apk_path"]
+                val maxHeap = params["max_heap"]
                 if (apkPath.isNullOrEmpty()) {
                     ResponseUtils.sendError(exchange, 400, "Missing required parameter 'apk_path'")
                     return@createContext
                 }
                 
-                val result = processManager.loadApk(apkPath)
+                val result = processManager.loadApk(apkPath, maxHeap)
                 ResponseUtils.sendSuccess(exchange, result)
             } catch (e: IllegalArgumentException) {
                 ResponseUtils.sendError(exchange, 400, e.message ?: "Bad Request")

@@ -89,13 +89,17 @@ class JadxMcpServer(
                 name = "apk_load",
                 description = "Dynamically load an Android APK file, spawn an isolated Worker process and return a unique apk_id UUID.",
                 inputSchema = createToolSchema(
-                    properties = mapOf("apk_path" to Pair("string", "Absolute path to target APK file (Required)")),
+                    properties = mapOf(
+                        "apk_path" to Pair("string", "Absolute path to target APK file (Required)"),
+                        "max_heap" to Pair("string", "Optional explicit Worker JVM heap memory size limit (e.g. '4g', '8g'). If omitted, calculated dynamically based on APK file size.")
+                    ),
                     required = listOf("apk_path")
                 )
             )
         ) { request ->
             val apkPath = requireNotNull(getArgString(request.arguments, "apk_path")) { "Missing required parameter 'apk_path'" }
-            val result = processManager.loadApk(apkPath)
+            val maxHeap = getArgString(request.arguments, "max_heap")
+            val result = processManager.loadApk(apkPath, maxHeap)
             CallToolResult(content = listOf(TextContent(text = gson.toJson(result))))
         }
 
