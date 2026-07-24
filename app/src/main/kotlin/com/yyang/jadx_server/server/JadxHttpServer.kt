@@ -196,14 +196,16 @@ class JadxHttpServer(private val port: Int) {
                 "/meta/main-activity" -> {
                     val activityClass = engine.getMainActivity()
                     if (activityClass != null) {
-                        ResponseUtils.sendSuccess(exchange, mapOf("class_name" to activityClass.fullName, "code" to engine.getClassSource(activityClass)))
+                        val timeout = params["timeout"]?.toLongOrNull()
+                        ResponseUtils.sendSuccess(exchange, mapOf("class_name" to activityClass.fullName, "code" to engine.getClassSource(activityClass, timeout)))
                     } else {
                         ResponseUtils.sendError(exchange, 404, "Main Activity not found")
                     }
                 }
                 "/decompile/java" -> {
                     val javaClass = engine.requireClass(params["class_name"])
-                    val code = engine.getClassSource(javaClass)
+                    val timeout = params["timeout"]?.toLongOrNull()
+                    val code = engine.getClassSource(javaClass, timeout)
                     ResponseUtils.sendSuccess(exchange, mapOf("class_name" to javaClass.fullName, "code" to code))
                 }
                 "/decompile/smali" -> {

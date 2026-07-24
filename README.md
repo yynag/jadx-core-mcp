@@ -23,7 +23,7 @@
 - 🚀 **Isolated Multi-Worker Process Pool**: Master daemon coordinates independent JVM Worker sub-processes bound to unique UUID `apk_id`s. Unloading an APK kills the Worker process, guaranteeing 100% OS-level heap memory reclamation with zero memory leaks.
 - 🤖 **Native Model Context Protocol (MCP) Support**: Built-in official `io.modelcontextprotocol:kotlin-sdk`. One-click launch in Stdio mode (`--mcp`) equips AI Agents (opencode, Claude Desktop, Cursor) with 20+ fine-grained Android reverse-engineering tools.
 - ⚡ **Sub-second Lazy Indexing & On-Demand Decompilation**: Instant APK loading (< 1-2s) parses DEX structures and indexes symbol tables without pre-decompiling source code. Single class decompilation executes on-demand in < 50ms.
-- 🛡️ **Built-in Timeout & Circuit Breaker**: Single-class 5-second decompilation timeout protection (`Future.get(5s)`) prevents malicious AST obfuscation loops from blocking thread pools.
+- 🛡️ **Built-in Timeout & Circuit Breaker**: Configurable single-class decompilation timeout protection (default: 20 seconds, configurable via `JADX_DECOMPILE_TIMEOUT` env, `jadx.decompile.timeout` sys prop, or API `timeout` parameter) prevents malicious AST obfuscation loops from blocking thread pools.
 - 💾 **Three-Tier Code Caching**: Aligned with JADX-GUI preferences (`DISK_WITH_CACHE`, `MEMORY`, `DISK`), powered by `SoftReference` for automatic garbage collection under memory pressure.
 - 🌐 **Clean RESTful API Architecture**: Strict `/domain/action` routing scheme covering `/apk/`, `/meta/`, `/decompile/`, `/resource/`, `/xref/`, and `/search/`.
 

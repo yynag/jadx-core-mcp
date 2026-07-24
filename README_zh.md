@@ -23,7 +23,7 @@
 - 🚀 **多 Worker 进程物理隔离池**：Master 主进程统一路由管理，Worker 子进程按需拉起并为每个 APK 生成唯一的 `apk_id`（UUID）。卸载 APK 时直接摧毁子进程，从操作系统层面物理回收 JVM 堆内存与 Native 句柄，实现零内存泄漏。
 - 🤖 **原生 MCP (Model Context Protocol) 协议支持**：内置官方 `io.modelcontextprotocol:kotlin-sdk`，通过 `--mcp` 参数一键启动 Stdio 模式，为 opencode、Claude Desktop、Cursor 等 AI Agent 提供原生 20+ JADX 逆向分析 Tools。
 - ⚡ **秒级惰性加载与按需反编译**：加载 APK 时仅解析 DEX 结构并建立符号表索引（1~2 秒内完成），不预先反编译 Class 源码；单类反编译按需响应（< 50ms）。
-- 🛡️ **超时断路防护**：集成单类 5 秒反编译超时保护 (`Future.get(5s)`)，防止极复杂混淆类引发死循环卡死 CPU。
+- 🛡️ **超时断路防护**：集成单类反编译超时保护（默认 20 秒，支持环境变量 `JADX_DECOMPILE_TIMEOUT`、JVM 属性 `jadx.decompile.timeout` 或请求参数 `timeout` 动态配置），防止极复杂混淆类引发死循环卡死 CPU。
 - 💾 **三级代码缓存机制**：对齐 JADX-GUI 系统偏实现偏好设置 (`DISK_WITH_CACHE`, `MEMORY`, `DISK`)，采用 `SoftReference` 软引用缓存保护 JVM 堆内存，当内存紧张时由 GC 自动回收。
 - 🌐 **纯粹的 RESTful 架构**：遵从 `/domain/action` 简洁领域划分（涵盖 `/apk/`、`/meta/`、`/decompile/`、`/resource/`、`/xref/`、`/search/`）。
 

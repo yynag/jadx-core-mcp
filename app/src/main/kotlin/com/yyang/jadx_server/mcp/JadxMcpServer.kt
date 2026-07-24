@@ -230,13 +230,18 @@ class JadxMcpServer(
                 name = "meta_main_activity",
                 description = "Directly retrieve main activity class name and Java source code.",
                 inputSchema = createToolSchema(
-                    properties = mapOf("apk_id" to Pair("string", "Target apk_id UUID")),
+                    properties = mapOf(
+                        "apk_id" to Pair("string", "Target apk_id UUID"),
+                        "timeout" to Pair("number", "Decompilation timeout in seconds (default: 20)")
+                    ),
                     required = listOf("apk_id")
                 )
             )
         ) { request ->
             val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val json = processManager.sendWorkerRequest(apkId, "/meta/main-activity")
+            val params = mutableMapOf<String, String>()
+            getArgInt(request.arguments, "timeout")?.let { params["timeout"] = it.toString() }
+            val json = processManager.sendWorkerRequest(apkId, "/meta/main-activity", params)
             CallToolResult(content = listOf(TextContent(text = json)))
         }
 
@@ -251,7 +256,8 @@ class JadxMcpServer(
                 inputSchema = createToolSchema(
                     properties = mapOf(
                         "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name (e.g. com.example.app.utils.CipherUtils)")
+                        "class_name" to Pair("string", "Fully qualified class name (e.g. com.example.app.utils.CipherUtils)"),
+                        "timeout" to Pair("number", "Decompilation timeout in seconds (default: 20)")
                     ),
                     required = listOf("apk_id", "class_name")
                 )
@@ -259,7 +265,9 @@ class JadxMcpServer(
         ) { request ->
             val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
             val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val json = processManager.sendWorkerRequest(apkId, "/decompile/java", mapOf("class_name" to className))
+            val params = mutableMapOf("class_name" to className)
+            getArgInt(request.arguments, "timeout")?.let { params["timeout"] = it.toString() }
+            val json = processManager.sendWorkerRequest(apkId, "/decompile/java", params)
             CallToolResult(content = listOf(TextContent(text = json)))
         }
 

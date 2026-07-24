@@ -25,7 +25,7 @@ import kotlin.concurrent.write
  * 2. Maintain symbol table index cache (`classCache`) for instant class lookup.
  * 3. Implement lazy loading and on-demand decompilation strategy.
  * 4. Integrate `JadxCacheManager` for disk and SoftReference caching.
- * 5. Integrate 5-second single-class decompilation timeout protection (`Future.get(5s)`).
+ * 5. Integrate configurable single-class decompilation timeout protection (default: 20s).
  * 6. Thread-safe operations protected by `ReentrantReadWriteLock`.
  */
 class JadxEngine {
@@ -172,28 +172,34 @@ class JadxEngine {
         }
     }
 
+    val defaultTimeoutSeconds: Long = System.getProperty("jadx.decompile.timeout")?.toLongOrNull()
+        ?: System.getenv("JADX_DECOMPILE_TIMEOUT")?.toLongOrNull()
+        ?: 20L
+
     /**
-     * Retrieve Java source code for specified class with 5-second timeout protection.
+     * Retrieve Java source code for specified class with configurable timeout protection.
      */
-    fun getClassSource(javaClass: JavaClass): String {
+    fun getClassSource(javaClass: JavaClass, timeoutSeconds: Long? = null): String {
         return rwLock.read {
             val cached = cacheManager?.getCachedSource(javaClass.fullName)
             if (cached != null) {
                 return@read cached
             }
 
+            val effectiveTimeout = (timeoutSeconds?.takeIf { it > 0 }) ?: defaultTimeoutSeconds
+
             val future = decompileExecutor.submit<String> {
                 javaClass.code
             }
 
             try {
-                val source = future.get(5, TimeUnit.SECONDS)
+                val source = future.get(effectiveTimeout, TimeUnit.SECONDS)
                 cacheManager?.saveCachedSource(javaClass.fullName, source)
                 source
             } catch (e: TimeoutException) {
                 future.cancel(true)
                 """
-                /* [JADX WARNING] Decompilation timed out (5s) for class ${javaClass.fullName}.
+                /* [JADX WARNING] Decompilation timed out (${effectiveTimeout}s) for class ${javaClass.fullName}.
                    This class may contain obfuscation patterns causing infinite loops in AST generation. */
                 public class ${javaClass.name} {
                     // Decompilation timed out.
