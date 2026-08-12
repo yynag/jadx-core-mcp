@@ -1,7 +1,7 @@
 package com.yyang.jadx_server.mcp
 
+import com.google.gson.GsonBuilder
 import com.yyang.jadx_server.server.JadxProcessManager
-import com.google.gson.Gson
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.server.StdioServerTransport
@@ -19,30 +19,32 @@ import kotlinx.io.buffered
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 
 /**
- * JADX Headless Stdio server based on official Model Context Protocol (MCP) Kotlin SDK.
- * 
- * Responsibilities:
- * 1. Declare and expose full suite of 20 JADX reverse-engineering tools;
- * 2. Bridge MCP client tool calls to underlying JadxProcessManager process pool and Worker nodes;
- * 3. Run in Stdio transport mode for AI Agent integrations (opencode, Claude Desktop, Cursor, etc.).
+ * MCP tool 注册（Stdio 与 HTTP Streamable 共用同一套 tools）。
+ *
+ * WHY: OpenCode remote 需要 MCP-over-HTTP；local 仍用 Stdio。业务只维护一份 tool 表。
+ * DECISION: createServer() 构建 Server；startStdio() / MasterKtor 分别挂传输层。
  */
 class JadxMcpServer(
-    private val processManager: JadxProcessManager,
-    private val mcpOutputStream: java.io.OutputStream = System.out
+    private val processManager: JadxProcessManager
 ) {
+    private val gson = GsonBuilder().disableHtmlEscaping().create()
 
-    private val gson = Gson()
+    private data class ToolDef(
+        val name: String,
+        val description: String,
+        val properties: Map<String, Pair<String, String>>,
+        val required: List<String>,
+        val handler: (JsonObject?) -> String
+    )
 
-    private fun createToolSchema(
-        properties: Map<String, Pair<String, String>> = emptyMap(),
-        required: List<String> = emptyList()
-    ): ToolSchema {
+    private fun schema(properties: Map<String, Pair<String, String>>, required: List<String>): ToolSchema {
         val propsJson = buildJsonObject {
             properties.forEach { (name, typeAndDesc) ->
                 putJsonObject(name) {
@@ -51,479 +53,290 @@ class JadxMcpServer(
                 }
             }
         }
-        return ToolSchema(
-            properties = propsJson,
-            required = required
-        )
+        return ToolSchema(properties = propsJson, required = required)
     }
 
-    private fun getArgString(args: JsonObject?, key: String): String? {
-        return args?.get(key)?.jsonPrimitive?.content
+    private fun argString(args: JsonObject?, key: String): String? =
+        args?.get(key)?.jsonPrimitive?.contentOrNull
+
+    private fun argLong(args: JsonObject?, key: String): Long? {
+        val p = args?.get(key)?.jsonPrimitive ?: return null
+        p.doubleOrNull?.let { return it.toLong() }
+        return p.contentOrNull?.toDoubleOrNull()?.toLong()
     }
 
-    private fun getArgInt(args: JsonObject?, key: String): Int? {
-        return args?.get(key)?.jsonPrimitive?.intOrNull
+    private fun argInt(args: JsonObject?, key: String): Int? = argLong(args, key)?.toInt()
+
+    private fun argBool(args: JsonObject?, key: String): Boolean? {
+        val p = args?.get(key)?.jsonPrimitive ?: return null
+        p.booleanOrNull?.let { return it }
+        return p.contentOrNull?.toBooleanStrictOrNull()
     }
 
-    private fun getArgBoolean(args: JsonObject?, key: String): Boolean? {
-        return args?.get(key)?.jsonPrimitive?.booleanOrNull
+    private fun requireArg(args: JsonObject?, key: String): String =
+        requireNotNull(argString(args, key)) { "Missing required parameter '$key'" }
+
+    private fun workerGet(
+        apkId: String,
+        path: String,
+        params: MutableMap<String, String> = mutableMapOf(),
+        timeoutSec: Long = 120
+    ): String {
+        val t = params["timeout"]?.toLongOrNull()?.let { it + 5 } ?: timeoutSec
+        return processManager.sendWorkerRequest(apkId, path, params, timeoutSec = t.coerceIn(5, 600))
     }
 
-    /**
-     * Build and start MCP Stdio service, listening on stdin.
-     */
-    fun start(): Unit = runBlocking {
-        val server = Server(
-            serverInfo = Implementation(name = "jadx-core-mcp", version = "1.0.0"),
-            options = ServerOptions(
-                capabilities = ServerCapabilities(tools = ServerCapabilities.Tools())
-            )
-        )
+    private fun ok(text: String) = CallToolResult(content = listOf(TextContent(text = text)), isError = false)
+    private fun err(message: String) = CallToolResult(content = listOf(TextContent(text = message)), isError = true)
 
-        // =================================================================
-        // 1. Service Lifecycle and Process Management Tools (apk_*)
-        // =================================================================
+    private fun buildTools(): List<ToolDef> {
+        val apkIdP = "apk_id" to ("string" to "Target apk_id UUID from apk_load")
+        val timeoutP = "timeout" to ("number" to "Per-call timeout seconds (Agent decides). Server hard-cap applies.")
+        val offsetP = "offset" to ("number" to "Pagination offset (default 0)")
+        val countP = "count" to ("number" to "Page size (default 50)")
+        val maxScanP = "max_scan" to ("number" to "Max classes to scan in one search (default 500)")
+        val maxDecompP = "max_decompile" to ("number" to "Max on-demand decompiles for scope=code (default 50)")
 
-        server.addTool(
-            Tool(
+        return listOf(
+            ToolDef(
                 name = "apk_load",
-                description = "Dynamically load an Android APK file, spawn an isolated Worker process and return a unique apk_id UUID.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_path" to Pair("string", "Absolute path to target APK file (Required)"),
-                        "max_heap" to Pair("string", "Optional explicit Worker JVM heap memory size limit (e.g. '4g', '8g'). If omitted, calculated dynamically based on APK file size.")
-                    ),
-                    required = listOf("apk_path")
-                )
-            )
-        ) { request ->
-            val apkPath = requireNotNull(getArgString(request.arguments, "apk_path")) { "Missing required parameter 'apk_path'" }
-            val maxHeap = getArgString(request.arguments, "max_heap")
-            val result = processManager.loadApk(apkPath, maxHeap)
-            CallToolResult(content = listOf(TextContent(text = gson.toJson(result))))
-        }
-
-        server.addTool(
-            Tool(
+                description = "Load APK into isolated Worker JVM; returns apk_id. On OOM/failure, message lists active instances — call apk_unload to free memory.",
+                properties = mapOf(
+                    "apk_path" to ("string" to "Absolute path to APK/DEX/JAR on the server host"),
+                    "max_heap" to ("string" to "Optional Worker heap e.g. 4g (Agent may set per APK size)")
+                ),
+                required = listOf("apk_path"),
+                handler = { args ->
+                    gson.toJson(processManager.loadApk(requireArg(args, "apk_path"), argString(args, "max_heap")))
+                }
+            ),
+            ToolDef(
                 name = "apk_unload",
-                description = "Unload Worker sub-process for specified apk_id and release OS heap memory.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "clear_cache" to Pair("boolean", "Whether to clean cache files synchronously (default: false)")
-                    ),
-                    required = listOf("apk_id")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val clearCache = getArgBoolean(request.arguments, "clear_cache") ?: false
-            val result = processManager.unloadApk(apkId, clearCache)
-            CallToolResult(content = listOf(TextContent(text = gson.toJson(result))))
-        }
-
-        server.addTool(
-            Tool(
+                description = "Destroy Worker for apk_id and reclaim heap. clear_cache deletes disk decompile cache.",
+                properties = mapOf(
+                    apkIdP,
+                    "clear_cache" to ("boolean" to "Delete disk cache (default false)")
+                ),
+                required = listOf("apk_id"),
+                handler = { args ->
+                    gson.toJson(processManager.unloadApk(requireArg(args, "apk_id"), argBool(args, "clear_cache") ?: false))
+                }
+            ),
+            ToolDef(
                 name = "apk_list",
-                description = "Get list of all active loaded apk_ids and their metadata in the process pool.",
-                inputSchema = createToolSchema()
-            )
-        ) { _ ->
-            val result = mapOf("apks" to processManager.listApks())
-            CallToolResult(content = listOf(TextContent(text = gson.toJson(result))))
-        }
-
-        // =================================================================
-        // 2. Metadata and Structure Analysis Tools (meta_*)
-        // =================================================================
-
-        server.addTool(
-            Tool(
-                name = "meta_manifest",
-                description = "Parse and extract raw text of AndroidManifest.xml for loaded APK.",
-                inputSchema = createToolSchema(
-                    properties = mapOf("apk_id" to Pair("string", "Target apk_id UUID")),
-                    required = listOf("apk_id")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val json = processManager.sendWorkerRequest(apkId, "/meta/manifest")
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
+                description = "List active apk_id workers.",
+                properties = emptyMap(),
+                required = emptyList(),
+                handler = { gson.toJson(mapOf("apks" to processManager.listApks())) }
+            ),
+            ToolDef(
                 name = "meta_summary",
-                description = "Get APK structural summary (total class count, main activity name, and APK path).",
-                inputSchema = createToolSchema(
-                    properties = mapOf("apk_id" to Pair("string", "Target apk_id UUID")),
-                    required = listOf("apk_id")
-                )
+                description = "APK summary: classesCount, mainActivity, path.",
+                properties = mapOf(apkIdP),
+                required = listOf("apk_id"),
+                handler = { args -> workerGet(requireArg(args, "apk_id"), "/meta/summary") }
+            ),
+            ToolDef(
+                name = "meta_manifest",
+                description = "Decoded AndroidManifest.xml text.",
+                properties = mapOf(apkIdP),
+                required = listOf("apk_id"),
+                handler = { args -> workerGet(requireArg(args, "apk_id"), "/meta/manifest") }
+            ),
+            ToolDef(
+                name = "meta_class",
+                description = "Without class_name: paginated FQCN list. With class_name: methods+fields names.",
+                properties = mapOf(
+                    apkIdP,
+                    "class_name" to ("string" to "FQCN"),
+                    "package" to ("string" to "Package filter when listing"),
+                    offsetP, countP
+                ),
+                required = listOf("apk_id"),
+                handler = { args ->
+                    val apkId = requireArg(args, "apk_id")
+                    val className = argString(args, "class_name")
+                    if (!className.isNullOrBlank()) {
+                        val methods = workerGet(apkId, "/meta/methods", mutableMapOf("class_name" to className))
+                        val fields = workerGet(apkId, "/meta/fields", mutableMapOf("class_name" to className))
+                        val m = gson.fromJson(methods, Map::class.java)
+                        val f = gson.fromJson(fields, Map::class.java)
+                        gson.toJson(mapOf("class_name" to className, "methods" to m["methods"], "fields" to f["fields"]))
+                    } else {
+                        val params = mutableMapOf<String, String>()
+                        argString(args, "package")?.let { params["package"] = it }
+                        argInt(args, "offset")?.let { params["offset"] = it.toString() }
+                        argInt(args, "count")?.let { params["count"] = it.toString() }
+                        workerGet(apkId, "/meta/classes", params)
+                    }
+                }
+            ),
+            ToolDef(
+                name = "decompile",
+                description = "On-demand decompile. target=java|smali|method|main_activity. Failures set isError (never fake source).",
+                properties = mapOf(
+                    apkIdP,
+                    "target" to ("string" to "java | smali | method | main_activity (default java)"),
+                    "class_name" to ("string" to "FQCN (required except main_activity)"),
+                    "method_name" to ("string" to "Required when target=method"),
+                    timeoutP
+                ),
+                required = listOf("apk_id"),
+                handler = { args ->
+                    val apkId = requireArg(args, "apk_id")
+                    val target = (argString(args, "target") ?: "java").lowercase()
+                    val params = mutableMapOf<String, String>()
+                    argLong(args, "timeout")?.let { params["timeout"] = it.toString() }
+                    when (target) {
+                        "java" -> {
+                            params["class_name"] = requireArg(args, "class_name")
+                            workerGet(apkId, "/decompile/java", params)
+                        }
+                        "smali" -> {
+                            params["class_name"] = requireArg(args, "class_name")
+                            workerGet(apkId, "/decompile/smali", params)
+                        }
+                        "method" -> {
+                            params["class_name"] = requireArg(args, "class_name")
+                            params["method_name"] = requireArg(args, "method_name")
+                            workerGet(apkId, "/decompile/method", params)
+                        }
+                        "main_activity" -> workerGet(apkId, "/meta/main-activity", params)
+                        else -> throw IllegalArgumentException("target must be java|smali|method|main_activity")
+                    }
+                }
+            ),
+            ToolDef(
+                name = "resource",
+                description = "action=list|file|strings. Missing file → error.",
+                properties = mapOf(
+                    apkIdP,
+                    "action" to ("string" to "list | file | strings (default list)"),
+                    "file_name" to ("string" to "For action=file"),
+                    offsetP, countP
+                ),
+                required = listOf("apk_id"),
+                handler = { args ->
+                    val apkId = requireArg(args, "apk_id")
+                    val action = (argString(args, "action") ?: "list").lowercase()
+                    val params = mutableMapOf<String, String>()
+                    argInt(args, "offset")?.let { params["offset"] = it.toString() }
+                    argInt(args, "count")?.let { params["count"] = it.toString() }
+                    when (action) {
+                        "list" -> workerGet(apkId, "/resource/list", params)
+                        "strings" -> workerGet(apkId, "/resource/strings", params)
+                        "file" -> {
+                            params["file_name"] = requireArg(args, "file_name")
+                            workerGet(apkId, "/resource/file", params)
+                        }
+                        else -> throw IllegalArgumentException("action must be list|file|strings")
+                    }
+                }
+            ),
+            ToolDef(
+                name = "xref",
+                description = "Cross-references. target_type=class|method|field.",
+                properties = mapOf(
+                    apkIdP,
+                    "target_type" to ("string" to "class | method | field"),
+                    "class_name" to ("string" to "FQCN"),
+                    "method_name" to ("string" to "For method"),
+                    "field_name" to ("string" to "For field"),
+                    offsetP, countP, timeoutP
+                ),
+                required = listOf("apk_id", "target_type", "class_name"),
+                handler = { args ->
+                    val apkId = requireArg(args, "apk_id")
+                    val type = requireArg(args, "target_type").lowercase()
+                    val params = mutableMapOf("class_name" to requireArg(args, "class_name"))
+                    argInt(args, "offset")?.let { params["offset"] = it.toString() }
+                    argInt(args, "count")?.let { params["count"] = it.toString() }
+                    argLong(args, "timeout")?.let { params["timeout"] = it.toString() }
+                    when (type) {
+                        "class" -> workerGet(apkId, "/xref/class", params)
+                        "method" -> {
+                            params["method_name"] = requireArg(args, "method_name")
+                            workerGet(apkId, "/xref/method", params)
+                        }
+                        "field" -> {
+                            params["field_name"] = requireArg(args, "field_name")
+                            workerGet(apkId, "/xref/field", params)
+                        }
+                        else -> throw IllegalArgumentException("target_type must be class|method|field")
+                    }
+                }
+            ),
+            ToolDef(
+                name = "search",
+                description = "scope=class (default)|code|method_name. code is budgeted via timeout/max_scan/max_decompile (Agent sets). Results are class names only.",
+                properties = mapOf(
+                    apkIdP,
+                    "scope" to ("string" to "class | code | method_name (default class)"),
+                    "search_term" to ("string" to "Keyword for class/code"),
+                    "method_name" to ("string" to "For scope=method_name"),
+                    "package" to ("string" to "Optional package filter"),
+                    "search_in" to ("string" to "Alias of scope for class/code"),
+                    maxScanP, maxDecompP,
+                    offsetP, countP, timeoutP
+                ),
+                required = listOf("apk_id"),
+                handler = { args ->
+                    val apkId = requireArg(args, "apk_id")
+                    val scope = (argString(args, "scope") ?: argString(args, "search_in") ?: "class").lowercase()
+                    val params = mutableMapOf<String, String>()
+                    argInt(args, "offset")?.let { params["offset"] = it.toString() }
+                    argInt(args, "count")?.let { params["count"] = it.toString() }
+                    argLong(args, "timeout")?.let { params["timeout"] = it.toString() }
+                    argInt(args, "max_scan")?.let { params["max_scan"] = it.toString() }
+                    argInt(args, "max_decompile")?.let { params["max_decompile"] = it.toString() }
+                    when (scope) {
+                        "method_name", "method" -> {
+                            params["method_name"] = argString(args, "method_name")
+                                ?: argString(args, "search_term")
+                                ?: throw IllegalArgumentException("method_name or search_term required")
+                            workerGet(apkId, "/search/method", params)
+                        }
+                        "class", "code" -> {
+                            params["search_term"] = requireArg(args, "search_term")
+                            params["search_in"] = scope
+                            argString(args, "package")?.let { params["package"] = it }
+                            workerGet(apkId, "/search/classes", params)
+                        }
+                        else -> throw IllegalArgumentException("scope must be class|code|method_name")
+                    }
+                }
             )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val json = processManager.sendWorkerRequest(apkId, "/meta/summary")
-            CallToolResult(content = listOf(TextContent(text = json)))
+        )
+    }
+
+    /** 构建已注册 tools 的 MCP Server 实例（每次会话可新建） */
+    fun createServer(): Server {
+        val server = Server(
+            serverInfo = Implementation(name = "jadx-core-mcp", version = "1.2.0"),
+            options = ServerOptions(capabilities = ServerCapabilities(tools = ServerCapabilities.Tools()))
+        )
+        for (def in buildTools()) {
+            server.addTool(
+                Tool(name = def.name, description = def.description, inputSchema = schema(def.properties, def.required))
+            ) { request ->
+                try {
+                    ok(def.handler(request.arguments))
+                } catch (e: Exception) {
+                    err(e.message ?: e::class.java.simpleName)
+                }
+            }
         }
+        return server
+    }
 
-        server.addTool(
-            Tool(
-                name = "meta_classes",
-                description = "Get paginated list of fully qualified class names in APK, optionally filtered by package prefix.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "package" to Pair("string", "Package name prefix filter (e.g. com.example.app)"),
-                        "offset" to Pair("number", "Pagination offset (default: 0)"),
-                        "count" to Pair("number", "Pagination count limit (default: 50)")
-                    ),
-                    required = listOf("apk_id")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val params = mutableMapOf<String, String>()
-            getArgString(request.arguments, "package")?.let { params["package"] = it }
-            getArgInt(request.arguments, "offset")?.let { params["offset"] = it.toString() }
-            getArgInt(request.arguments, "count")?.let { params["count"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/meta/classes", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "meta_methods",
-                description = "Query method signatures declared in specified Class.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name (e.g. com.example.app.MainActivity)")
-                    ),
-                    required = listOf("apk_id", "class_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val json = processManager.sendWorkerRequest(apkId, "/meta/methods", mapOf("class_name" to className))
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "meta_fields",
-                description = "Query field declarations in specified Class.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name (e.g. com.example.app.MainActivity)")
-                    ),
-                    required = listOf("apk_id", "class_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val json = processManager.sendWorkerRequest(apkId, "/meta/fields", mapOf("class_name" to className))
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "meta_main_activity",
-                description = "Directly retrieve main activity class name and Java source code.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "timeout" to Pair("number", "Decompilation timeout in seconds (default: 20)")
-                    ),
-                    required = listOf("apk_id")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val params = mutableMapOf<String, String>()
-            getArgInt(request.arguments, "timeout")?.let { params["timeout"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/meta/main-activity", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        // =================================================================
-        // 3. On-Demand Decompilation Tools (decompile_*)
-        // =================================================================
-
-        server.addTool(
-            Tool(
-                name = "decompile_class",
-                description = "Decompile Java source code on-demand for specified Class.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name (e.g. com.example.app.utils.CipherUtils)"),
-                        "timeout" to Pair("number", "Decompilation timeout in seconds (default: 20)")
-                    ),
-                    required = listOf("apk_id", "class_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val params = mutableMapOf("class_name" to className)
-            getArgInt(request.arguments, "timeout")?.let { params["timeout"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/decompile/java", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "decompile_smali",
-                description = "Get Smali disassembly bytecode for specified Class.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name")
-                    ),
-                    required = listOf("apk_id", "class_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val json = processManager.sendWorkerRequest(apkId, "/decompile/smali", mapOf("class_name" to className))
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "decompile_method",
-                description = "Extract Java source code snippet for a specific Method in Class.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name"),
-                        "method_name" to Pair("string", "Method name (e.g. onCreate or encryptAES)")
-                    ),
-                    required = listOf("apk_id", "class_name", "method_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val methodName = requireNotNull(getArgString(request.arguments, "method_name")) { "Missing required parameter 'method_name'" }
-            val json = processManager.sendWorkerRequest(
-                apkId,
-                "/decompile/method",
-                mapOf("class_name" to className, "method_name" to methodName)
-            )
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        // =================================================================
-        // 4. Resource File Tools (resource_*)
-        // =================================================================
-
-        server.addTool(
-            Tool(
-                name = "resource_strings",
-                description = "Paginated extraction of strings.xml string table entries from APK.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "offset" to Pair("number", "Pagination offset (default: 0)"),
-                        "count" to Pair("number", "Pagination count limit (default: 50)")
-                    ),
-                    required = listOf("apk_id")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val params = mutableMapOf<String, String>()
-            getArgInt(request.arguments, "offset")?.let { params["offset"] = it.toString() }
-            getArgInt(request.arguments, "count")?.let { params["count"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/resource/strings", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "resource_list",
-                description = "Paginated list of all resource file relative paths in APK (e.g. res/xml/...).",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "offset" to Pair("number", "Pagination offset (default: 0)"),
-                        "count" to Pair("number", "Pagination count limit (default: 50)")
-                    ),
-                    required = listOf("apk_id")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val params = mutableMapOf<String, String>()
-            getArgInt(request.arguments, "offset")?.let { params["offset"] = it.toString() }
-            getArgInt(request.arguments, "count")?.let { params["count"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/resource/list", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "resource_file",
-                description = "Retrieve text content of specified resource file (e.g. network configs, layout XMLs).",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "file_name" to Pair("string", "Relative path to resource file (e.g. res/xml/network_security_config.xml)")
-                    ),
-                    required = listOf("apk_id", "file_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val fileName = requireNotNull(getArgString(request.arguments, "file_name")) { "Missing required parameter 'file_name'" }
-            val json = processManager.sendWorkerRequest(apkId, "/resource/file", mapOf("file_name" to fileName))
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        // =================================================================
-        // 5. Cross Reference and Search Tools (xref_* & search_*)
-        // =================================================================
-
-        server.addTool(
-            Tool(
-                name = "xref_class",
-                description = "Find cross references to specified Class (usage sites and code snippets).",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name"),
-                        "offset" to Pair("number", "Pagination offset (default: 0)"),
-                        "count" to Pair("number", "Pagination count limit (default: 50)")
-                    ),
-                    required = listOf("apk_id", "class_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val params = mutableMapOf("class_name" to className)
-            getArgInt(request.arguments, "offset")?.let { params["offset"] = it.toString() }
-            getArgInt(request.arguments, "count")?.let { params["count"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/xref/class", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "xref_method",
-                description = "Find call sites and code snippets for specified Method.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name"),
-                        "method_name" to Pair("string", "Target method name"),
-                        "offset" to Pair("number", "Pagination offset (default: 0)"),
-                        "count" to Pair("number", "Pagination count limit (default: 50)")
-                    ),
-                    required = listOf("apk_id", "class_name", "method_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val methodName = requireNotNull(getArgString(request.arguments, "method_name")) { "Missing required parameter 'method_name'" }
-            val params = mutableMapOf("class_name" to className, "method_name" to methodName)
-            getArgInt(request.arguments, "offset")?.let { params["offset"] = it.toString() }
-            getArgInt(request.arguments, "count")?.let { params["count"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/xref/method", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "xref_field",
-                description = "Find read/write reference code snippets for specified Field variable.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "class_name" to Pair("string", "Fully qualified class name"),
-                        "field_name" to Pair("string", "Target field name"),
-                        "offset" to Pair("number", "Pagination offset (default: 0)"),
-                        "count" to Pair("number", "Pagination count limit (default: 50)")
-                    ),
-                    required = listOf("apk_id", "class_name", "field_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val className = requireNotNull(getArgString(request.arguments, "class_name")) { "Missing required parameter 'class_name'" }
-            val fieldName = requireNotNull(getArgString(request.arguments, "field_name")) { "Missing required parameter 'field_name'" }
-            val params = mutableMapOf("class_name" to className, "field_name" to fieldName)
-            getArgInt(request.arguments, "offset")?.let { params["offset"] = it.toString() }
-            getArgInt(request.arguments, "count")?.let { params["count"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/xref/field", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "search_classes",
-                description = "Global search for classes matching term in code, class names, method names or comments.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "search_term" to Pair("string", "Search keyword (e.g. AES/CBC or API endpoint)"),
-                        "search_in" to Pair("string", "Search scope (code|class|method|field|comment), default: code"),
-                        "package" to Pair("string", "Package name filter"),
-                        "offset" to Pair("number", "Pagination offset (default: 0)"),
-                        "count" to Pair("number", "Pagination count limit (default: 50)")
-                    ),
-                    required = listOf("apk_id", "search_term")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val searchTerm = requireNotNull(getArgString(request.arguments, "search_term")) { "Missing required parameter 'search_term'" }
-            val params = mutableMapOf("search_term" to searchTerm)
-            getArgString(request.arguments, "search_in")?.let { params["search_in"] = it }
-            getArgString(request.arguments, "package")?.let { params["package"] = it }
-            getArgInt(request.arguments, "offset")?.let { params["offset"] = it.toString() }
-            getArgInt(request.arguments, "count")?.let { params["count"] = it.toString() }
-            val json = processManager.sendWorkerRequest(apkId, "/search/classes", params)
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        server.addTool(
-            Tool(
-                name = "search_method",
-                description = "Fuzzy match method name across all classes.",
-                inputSchema = createToolSchema(
-                    properties = mapOf(
-                        "apk_id" to Pair("string", "Target apk_id UUID"),
-                        "method_name" to Pair("string", "Method name keyword")
-                    ),
-                    required = listOf("apk_id", "method_name")
-                )
-            )
-        ) { request ->
-            val apkId = requireNotNull(getArgString(request.arguments, "apk_id")) { "Missing required parameter 'apk_id'" }
-            val methodName = requireNotNull(getArgString(request.arguments, "method_name")) { "Missing required parameter 'method_name'" }
-            val json = processManager.sendWorkerRequest(apkId, "/search/method", mapOf("method_name" to methodName))
-            CallToolResult(content = listOf(TextContent(text = json)))
-        }
-
-        // =================================================================
-        // 6. Connect and run in Stdio Transport listening mode
-        // =================================================================
-
+    /** 本机 OpenCode type=local：Stdio 传输 */
+    fun startStdio(mcpOutputStream: java.io.OutputStream = System.out): Unit = runBlocking {
+        val server = createServer()
         val transport = StdioServerTransport(
             input = System.`in`.asSource().buffered(),
             output = mcpOutputStream.asSink().buffered()
         )
         server.createSession(transport)
-        
-        // Suspend main thread to keep MCP service online
         awaitCancellation()
     }
 }

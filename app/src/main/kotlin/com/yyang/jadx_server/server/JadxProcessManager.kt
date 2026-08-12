@@ -1,6 +1,7 @@
 package com.yyang.jadx_server.server
 
-import com.sun.net.httpserver.HttpExchange
+import com.yyang.jadx_server.cache.JadxCacheManager
+import org.slf4j.LoggerFactory
 import java.io.File
 import java.net.ServerSocket
 import java.net.URI
@@ -10,11 +11,13 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
- * Worker sub-process lifecycle and multi-APK process pool manager.
+ * WHY: 一 APK 一 JVM 对抗 jadx 高内存；卸载靠杀进程。
+ * DECISION: 不限制 Worker 数量；load 失败（尤其 OOM）时提示 Agent 用 apk_unload 清理；Worker 仅绑 127.0.0.1。
  */
 data class WorkerInstance(
     val apkId: String,
@@ -26,33 +29,58 @@ data class WorkerInstance(
 )
 
 class JadxProcessManager {
-
+    private val log = LoggerFactory.getLogger(JadxProcessManager::class.java)
     private val lock = ReentrantLock()
     private val workers = ConcurrentHashMap<String, WorkerInstance>()
 
     private val httpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(120))
+        .connectTimeout(Duration.ofSeconds(30))
         .build()
 
-    private fun findAvailablePort(): Int {
-        ServerSocket(0).use { socket ->
-            return socket.localPort
+    @Volatile private var shutdownHookRegistered = false
+
+    init {
+        ensureShutdownHook()
+    }
+
+    private fun ensureShutdownHook() {
+        if (shutdownHookRegistered) return
+        synchronized(this) {
+            if (shutdownHookRegistered) return
+            Runtime.getRuntime().addShutdownHook(Thread {
+                log.info("Shutdown hook: destroying all workers...")
+                shutdownAll()
+            })
+            shutdownHookRegistered = true
         }
     }
 
-    /**
-     * 根据文件大小及外部输入/环境变量动态计算 JVM -Xmx 堆内存上限。
-     * 依据：JADX load() 阶段需要构建全量 ClassNode 及全局 XRef 引用链，大型 APK 产生数百万节点，内存消耗与文件体积成正比。
-     */
+    fun shutdownAll() {
+        for (id in workers.keys.toList()) {
+            try {
+                unloadApk(id, clearCache = false)
+            } catch (e: Exception) {
+                log.warn("Failed to unload {}: {}", id, e.message)
+            }
+        }
+    }
+
+    private fun findAvailablePort(): Int {
+        ServerSocket(0).use { return it.localPort }
+    }
+
     private fun calculateMaxHeap(file: File, requestedMaxHeap: String?): String {
         if (!requestedMaxHeap.isNullOrBlank()) {
-            return if (requestedMaxHeap.startsWith("-Xmx")) requestedMaxHeap else "-Xmx$requestedMaxHeap"
+            val v = requestedMaxHeap.removePrefix("-Xmx")
+            require(v.matches(Regex("^\\d+[kKmMgG]$"))) { "Invalid max_heap format: $requestedMaxHeap (expected e.g. 4g)" }
+            return "-Xmx$v"
         }
+        // 部署级默认堆：长期机器偏好
         val envXmx = System.getenv("JADX_WORKER_XMX")
         if (!envXmx.isNullOrBlank()) {
-            return if (envXmx.startsWith("-Xmx")) envXmx else "-Xmx$envXmx"
+            return if (envXmx.startsWith("-Xmx")) envXmx else "-Xmx${envXmx.removePrefix("-Xmx")}"
         }
-        val sizeMb = file.length() / (1024 * 1024)
+        val sizeMb = if (file.isFile) file.length() / (1024 * 1024) else 50
         return when {
             sizeMb < 20 -> "-Xmx2g"
             sizeMb < 50 -> "-Xmx4g"
@@ -61,54 +89,80 @@ class JadxProcessManager {
         }
     }
 
-    /**
-     * 根据 APK 文件体积动态计算健康检查超时时长（单位：毫秒）。
-     */
     private fun calculateTimeoutMs(file: File): Long {
         val envSec = System.getenv("JADX_WORKER_TIMEOUT_SEC")?.toLongOrNull()
-        if (envSec != null && envSec > 0) {
-            return envSec * 1000L
-        }
-        val sizeMb = file.length() / (1024 * 1024)
+        if (envSec != null && envSec > 0) return envSec * 1000L
+        val sizeMb = if (file.isFile) file.length() / (1024 * 1024) else 50
         val calculatedSec = 60L + (sizeMb / 10L) * 30L
         return calculatedSec.coerceAtLeast(60L).coerceAtMost(600L) * 1000L
     }
 
-    /**
-     * 辅助函数：读取指定 Worker 日志文件的末尾若干行，用于崩溃诊断。
-     */
     private fun readTailLog(logFile: File, linesCount: Int = 15): String {
         if (!logFile.exists()) return "Log file does not exist."
         return try {
-            val lines = logFile.readLines()
-            lines.takeLast(linesCount).joinToString("\n")
+            logFile.readLines().takeLast(linesCount).joinToString("\n")
         } catch (e: Exception) {
             "Failed to read log: ${e.message}"
         }
     }
 
-    /**
-     * Dynamically load a new APK and generate a UUID identifier.
-     * @param apkPath Target APK file absolute path.
-     * @param maxHeap Optional explicit JVM max heap setting (e.g., "4g", "8g"). If omitted, calculated dynamically.
-     */
-    fun loadApk(apkPath: String, maxHeap: String? = null): Map<String, Any> {
-        val file = File(apkPath)
-        if (!file.exists()) {
-            throw IllegalArgumentException("Target APK file not found at path: $apkPath")
+    private fun activeInstancesHint(): String {
+        val list = listApks()
+        if (list.isEmpty()) return "No other active apk instances."
+        val lines = list.joinToString("\n") { m ->
+            "- apk_id=${m["apk_id"]} path=${m["apk_path"]} ready=${m["is_ready"]}"
         }
+        return "Active instances (${list.size}). Call apk_unload on unused apk_id to free memory:\n$lines"
+    }
+
+    private fun validateApkPath(apkPath: String): File {
+        if (apkPath.contains(",")) {
+            val parts = apkPath.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            require(parts.isNotEmpty()) { "Empty apk_path" }
+            for (p in parts) {
+                require(File(p).exists()) { "Target APK file not found at path: $p" }
+            }
+            return File(parts[0])
+        }
+        val file = File(apkPath)
+        if (!file.exists()) throw IllegalArgumentException("Target APK file not found at path: $apkPath")
+        return file
+    }
+
+    private fun reapDeadWorkers() {
+        val dead = workers.entries.filter { !it.value.process.isAlive }.map { it.key }
+        for (id in dead) {
+            workers.remove(id)
+            log.info("Reaped dead worker apk_id={}", id)
+        }
+    }
+
+    fun loadApk(apkPath: String, maxHeap: String? = null): Map<String, Any> {
+        val file = validateApkPath(apkPath)
+        val apkId: String
+        val port: Int
+        val xmxArg: String
+        val timeoutMs: Long
+        val proc: Process
+        val workerLogFile: File
 
         lock.withLock {
-            val apkId = UUID.randomUUID().toString()
+            reapDeadWorkers()
+            apkId = UUID.randomUUID().toString()
             val javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
             val classPath = System.getProperty("java.class.path")
-            val port = findAvailablePort()
+            port = findAvailablePort()
             val masterPid = ProcessHandle.current().pid()
+            xmxArg = calculateMaxHeap(file, maxHeap)
+            timeoutMs = calculateTimeoutMs(file)
 
-            val xmxArg = calculateMaxHeap(file, maxHeap)
-            val timeoutMs = calculateTimeoutMs(file)
-            println("[ProcessManager] Creating isolated Worker process for $apkPath (apk_id: $apkId, assigned port: $port, heap: $xmxArg, timeout: ${timeoutMs / 1000}s)...")
+            log.info("Creating Worker path={} apk_id={} port={} heap={}", apkPath, apkId, port, xmxArg)
 
+            val logDir = File("logs")
+            if (!logDir.exists()) logDir.mkdirs()
+            workerLogFile = File(logDir, "worker_$apkId.log")
+
+            // Worker 仅本机回环：Master 代理走 127.0.0.1，不对外暴露 Worker 端口
             val pb = ProcessBuilder(
                 javaBin,
                 xmxArg,
@@ -116,209 +170,149 @@ class JadxProcessManager {
                 "com.yyang.jadx_server.worker.JadxWorkerMainKt",
                 "--apk", apkPath,
                 "--port", port.toString(),
+                "--apk-id", apkId,
                 "--master-pid", masterPid.toString()
             )
-            val logDir = File("logs")
-            if (!logDir.exists()) {
-                logDir.mkdirs()
-            }
-            val workerLogFile = File(logDir, "worker_$apkId.log")
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(workerLogFile))
             pb.redirectError(ProcessBuilder.Redirect.appendTo(workerLogFile))
+            pb.environment()["JADX_ROLE"] = "worker"
+            pb.environment()["JADX_APK_ID"] = apkId
 
-            val proc = pb.start()
-            val instance = WorkerInstance(
-                apkId = apkId,
-                apkPath = apkPath,
-                port = port,
-                process = proc
-            )
-
-            // Health check polling until Worker is ready
-            val startTime = System.currentTimeMillis()
-            var isReady = false
-            while (System.currentTimeMillis() - startTime < timeoutMs) {
-                if (!proc.isAlive) {
-                    val exitCode = proc.exitValue()
-                    val tailLog = readTailLog(workerLogFile)
-                    val errorReason = if (exitCode == 137 || exitCode == 9) {
-                        "Worker process killed by OS (Out Of Memory / Exit Code $exitCode). Heap setting: $xmxArg. Try specifying a larger max_heap parameter."
-                    } else {
-                        "Worker process exited unexpectedly with Exit Code $exitCode."
-                    }
-                    throw IllegalStateException("Worker sub-process (apk_id: $apkId) failed during startup: $errorReason\n--- Tail Logs ---\n$tailLog")
-                }
-                try {
-                    val req = HttpRequest.newBuilder()
-                        .uri(URI.create("http://127.0.0.1:$port/health"))
-                        .GET()
-                        .timeout(Duration.ofSeconds(1))
-                        .build()
-                    val resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-                    if (resp.statusCode() == 200 && resp.body().contains("\"isLoaded\":true")) {
-                        isReady = true
-                        break
-                    }
-                } catch (e: Exception) {
-                    // Worker starting up...
-                }
-                Thread.sleep(200)
+            proc = pb.start()
+            proc.onExit().thenAccept {
+                workers.remove(apkId)
+                log.info("Worker exited apk_id={} code={}", apkId, it.exitValue())
             }
+        }
 
-            if (!isReady) {
-                val isAlive = proc.isAlive
-                proc.destroyForcibly()
+        val startTime = System.currentTimeMillis()
+        var isReady = false
+        while (System.currentTimeMillis() - startTime < timeoutMs) {
+            if (!proc.isAlive) {
+                val exitCode = try { proc.exitValue() } catch (_: Exception) { -1 }
                 val tailLog = readTailLog(workerLogFile)
-                throw IllegalStateException("Worker sub-process (apk_id: $apkId) failed health check within ${timeoutMs / 1000} seconds (wasAlive: $isAlive).\n--- Tail Logs ---\n$tailLog")
-            }
-
-            instance.isReady = true
-            workers[apkId] = instance
-            println("[ProcessManager] Worker sub-process started successfully. apk_id: $apkId, target APK: $apkPath")
-            return mapOf(
-                "status" to "success",
-                "apk_id" to apkId,
-                "apk_path" to apkPath,
-                "worker_port" to port
-            )
-        }
-    }
-
-    /**
-     * Unload Worker sub-process for specified apk_id and reclaim heap memory.
-     */
-    fun unloadApk(apkId: String, clearCache: Boolean = false): Map<String, Any> {
-        lock.withLock {
-            val instance = workers.remove(apkId)
-                ?: throw IllegalArgumentException("No running instance found for apk_id '$apkId'.")
-
-            instance.isReady = false
-            if (instance.process.isAlive) {
-                println("[ProcessManager] Destroying running Worker sub-process (apk_id: $apkId)...")
-                instance.process.destroyForcibly()
-                instance.process.waitFor()
-            }
-
-            if (clearCache) {
-                try {
-                    val file = File(instance.apkPath)
-                    val parent = file.parentFile ?: File(".")
-                    val cacheDir = File(parent, "${file.name}_jadx_cache")
-                    if (cacheDir.exists()) cacheDir.deleteRecursively()
-                } catch (e: Exception) {
-                    // Ignore cache cleanup errors
+                val oom = exitCode == 137 || exitCode == 9
+                val errorReason = if (oom) {
+                    "Worker OOM/killed (exit $exitCode). Heap was $xmxArg. " +
+                        "Try larger max_heap on apk_load, or unload unused instances first. " +
+                        activeInstancesHint()
+                } else {
+                    "Worker exited with code $exitCode. ${activeInstancesHint()}\n--- Tail ---\n$tailLog"
                 }
+                throw IllegalStateException("Worker startup failed (apk_id=$apkId): $errorReason")
             }
+            try {
+                val req = HttpRequest.newBuilder()
+                    .uri(URI.create("http://127.0.0.1:$port/health"))
+                    .GET()
+                    .timeout(Duration.ofSeconds(1))
+                    .build()
+                val resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+                if (resp.statusCode() == 200 && resp.body().contains("\"isLoaded\":true")) {
+                    isReady = true
+                    break
+                }
+            } catch (_: Exception) {
+            }
+            Thread.sleep(200)
+        }
 
-            return mapOf(
-                "status" to "success",
-                "message" to "Worker sub-process destroyed and memory reclaimed.",
-                "apk_id" to apkId
+        if (!isReady) {
+            proc.destroyForcibly()
+            proc.waitFor(10, TimeUnit.SECONDS)
+            val tailLog = readTailLog(workerLogFile)
+            throw IllegalStateException(
+                "Worker health check failed within ${timeoutMs / 1000}s (apk_id=$apkId). " +
+                    "${activeInstancesHint()}\n--- Tail ---\n$tailLog"
             )
         }
+
+        workers[apkId] = WorkerInstance(apkId, apkPath, port, proc, isReady = true)
+        log.info("Worker ready apk_id={}", apkId)
+        return mapOf(
+            "status" to "success",
+            "apk_id" to apkId,
+            "apk_path" to apkPath,
+            "worker_port" to port
+        )
     }
 
-    /**
-     * List all active APK instances running in the system.
-     */
+    fun unloadApk(apkId: String, clearCache: Boolean = false): Map<String, Any> {
+        val instance = lock.withLock {
+            workers.remove(apkId)
+                ?: throw IllegalArgumentException("No running instance found for apk_id '$apkId'.")
+        }
+        instance.isReady = false
+        if (instance.process.isAlive) {
+            log.info("Destroying Worker apk_id={}", apkId)
+            instance.process.destroyForcibly()
+            instance.process.waitFor(30, TimeUnit.SECONDS)
+        }
+        if (clearCache) {
+            try {
+                val cacheRoot = JadxCacheManager.resolveCacheRoot(instance.apkPath)
+                if (cacheRoot.exists()) cacheRoot.deleteRecursively()
+            } catch (e: Exception) {
+                log.warn("clear_cache failed: {}", e.message)
+            }
+        }
+        return mapOf(
+            "status" to "success",
+            "message" to "Worker destroyed and memory reclaimed.",
+            "apk_id" to apkId
+        )
+    }
+
     fun listApks(): List<Map<String, Any>> {
+        reapDeadWorkers()
         return workers.values.map {
             mapOf(
                 "apk_id" to it.apkId,
                 "apk_path" to it.apkPath,
                 "is_ready" to (it.isReady && it.process.isAlive),
-                "start_time" to it.startTime
+                "start_time" to it.startTime,
+                "worker_port" to it.port
             )
         }
     }
 
-    /**
-     * Check if a Worker instance with given apkId exists and is alive.
-     */
     fun isWorkerAlive(apkId: String): Boolean {
         val w = workers[apkId] ?: return false
-        return w.isReady && w.process.isAlive
+        if (!w.process.isAlive) {
+            workers.remove(apkId)
+            return false
+        }
+        return w.isReady
     }
 
-    /**
-     * Send internal HTTP request to a specific Worker sub-process and return response string.
-     */
-    fun sendWorkerRequest(apkId: String, path: String, params: Map<String, String> = emptyMap()): String {
+    fun sendWorkerRequest(
+        apkId: String,
+        path: String,
+        params: Map<String, String> = emptyMap(),
+        timeoutSec: Long = 120
+    ): String {
         val instance = workers[apkId]
             ?: throw IllegalArgumentException("No running instance found for apk_id '$apkId'.")
         if (!instance.isReady || !instance.process.isAlive) {
-            throw IllegalStateException("Worker sub-process for apk_id '$apkId' is not ready or has terminated.")
+            workers.remove(apkId)
+            throw IllegalStateException("Worker for apk_id '$apkId' is not ready or has terminated.")
         }
-
         val queryString = if (params.isNotEmpty()) {
             "?" + params.entries.joinToString("&") { (k, v) ->
-                java.net.URLEncoder.encode(k, java.nio.charset.StandardCharsets.UTF_8) + "=" +
-                        java.net.URLEncoder.encode(v, java.nio.charset.StandardCharsets.UTF_8)
+                java.net.URLEncoder.encode(k, Charsets.UTF_8) + "=" +
+                    java.net.URLEncoder.encode(v, Charsets.UTF_8)
             }
         } else ""
-
         val targetUrl = "http://127.0.0.1:${instance.port}$path$queryString"
         val request = HttpRequest.newBuilder()
             .uri(URI.create(targetUrl))
             .GET()
-            .timeout(Duration.ofSeconds(120))
+            .timeout(Duration.ofSeconds(timeoutSec.coerceIn(5, 600)))
             .build()
-
         val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() >= 400) {
-            throw IllegalStateException("Worker node returned error ${response.statusCode()}: ${response.body()}")
+            throw IllegalStateException("Worker error ${response.statusCode()}: ${response.body()}")
         }
         return response.body()
-    }
-
-    /**
-     * Transparently proxy HTTP request to Worker sub-process corresponding to apk_id.
-     */
-    fun proxyToWorker(apkId: String, exchange: HttpExchange) {
-        val instance = workers[apkId]
-        if (instance == null || !instance.isReady || !instance.process.isAlive) {
-            ResponseUtils.sendError(exchange, 404, "No active Worker sub-process found for apk_id '$apkId'.")
-            return
-        }
-
-        val targetPort = instance.port
-        val uri = exchange.requestURI
-        val targetUrl = "http://127.0.0.1:$targetPort${uri.rawPath}${if (uri.rawQuery != null) "?" + uri.rawQuery else ""}"
-        var headersSent = false
-
-        try {
-            val reqBuilder = HttpRequest.newBuilder()
-                .uri(URI.create(targetUrl))
-                .timeout(Duration.ofSeconds(120))
-
-            val method = exchange.requestMethod.uppercase()
-            when (method) {
-                "GET" -> reqBuilder.GET()
-                "POST" -> reqBuilder.POST(HttpRequest.BodyPublishers.ofInputStream { exchange.requestBody })
-                "DELETE" -> reqBuilder.DELETE()
-                else -> reqBuilder.method(method, HttpRequest.BodyPublishers.ofInputStream { exchange.requestBody })
-            }
-
-            val response = httpClient.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofInputStream())
-
-            exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
-            exchange.responseHeaders.add("Access-Control-Allow-Origin", "*")
-
-            exchange.sendResponseHeaders(response.statusCode(), 0)
-            headersSent = true
-
-            response.body().use { input ->
-                exchange.responseBody.use { output ->
-                    input.copyTo(output)
-                }
-            }
-        } catch (e: Exception) {
-            if (headersSent) {
-                System.err.println("[ProcessManager] IO error during streaming proxy response: ${e.message}")
-                try { exchange.responseBody.close() } catch (ignored: Exception) {}
-            } else {
-                ResponseUtils.sendError(exchange, 500, "Proxy error: ${e.message}")
-            }
-        }
     }
 }

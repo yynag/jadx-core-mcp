@@ -1,160 +1,80 @@
 package com.yyang.jadx_server.server
 
-import com.yyang.jadx_server.service.JadxEngine
-import com.sun.net.httpserver.HttpServer
 import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import com.yyang.jadx_server.service.DecompileException
+import com.yyang.jadx_server.service.JadxEngine
+import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.concurrent.Executors
 
 /**
- * HTTP service route dispatcher built on JDK HttpServer.
- * Follows /domain/action domain separation and explicit contracts.
+ * Worker 进程内 HTTP（仅业务 API）。
+ *
+ * WHY: Master 已迁 Ktor（REST+MCP）；Worker 保持轻量 JDK HttpServer，且只绑 127.0.0.1。
+ * DECISION: 无 /apk/load；无 ProcessManager。
  */
-class JadxHttpServer(private val port: Int) {
-    
-    val engine = JadxEngine()
-    val processManager = JadxProcessManager()
+class JadxHttpServer(
+    private val port: Int,
+    cacheInstanceKey: String = "worker"
+) {
+    private val log = LoggerFactory.getLogger(JadxHttpServer::class.java)
+    val engine = JadxEngine(cacheInstanceKey = cacheInstanceKey)
+    private var httpServer: HttpServer? = null
 
     fun start() {
-        val server = HttpServer.create(InetSocketAddress(port), 0)
+        // 仅本机：Master 通过 127.0.0.1 代理，不对外
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", port), 0)
         server.executor = Executors.newCachedThreadPool()
+        httpServer = server
 
-        // ==========================================
-        // 1. Service control & dynamic loading APIs (/apk/* & /health)
-        // ==========================================
-        
         server.createContext("/health") { exchange ->
             if (ResponseUtils.handleOptions(exchange)) return@createContext
-            if (engine.currentApkPath != null) {
-                // Worker node health check
-                val response = mapOf(
+            ResponseUtils.sendSuccess(
+                exchange,
+                mapOf(
                     "status" to "ok",
-                    "apk" to engine.currentApkPath!!,
+                    "role" to "worker",
+                    "apk" to (engine.currentApkPath ?: ""),
                     "classesCount" to engine.classesCount,
-                    "isLoaded" to true
+                    "isLoaded" to (engine.currentApkPath != null)
                 )
-                ResponseUtils.sendSuccess(exchange, response)
-            } else {
-                // Master node health check
-                val response = mapOf(
-                    "status" to "ok",
-                    "activeApksCount" to processManager.listApks().size,
-                    "isMaster" to true
-                )
-                ResponseUtils.sendSuccess(exchange, response)
-            }
+            )
         }
 
-        server.createContext("/apk/list") { exchange ->
-            if (ResponseUtils.handleOptions(exchange)) return@createContext
-            ResponseUtils.sendSuccess(exchange, mapOf("apks" to processManager.listApks()))
-        }
-        
-        server.createContext("/apk/load") { exchange ->
-            if (ResponseUtils.handleOptions(exchange)) return@createContext
-            try {
-                val params = ResponseUtils.parseRequestParams(exchange)
-                val apkPath = params["apk_path"]
-                val maxHeap = params["max_heap"]
-                if (apkPath.isNullOrEmpty()) {
-                    ResponseUtils.sendError(exchange, 400, "Missing required parameter 'apk_path'")
-                    return@createContext
-                }
-                
-                val result = processManager.loadApk(apkPath, maxHeap)
-                ResponseUtils.sendSuccess(exchange, result)
-            } catch (e: IllegalArgumentException) {
-                ResponseUtils.sendError(exchange, 400, e.message ?: "Bad Request")
-            } catch (e: Exception) {
-                ResponseUtils.sendError(exchange, 500, e.message ?: "Internal Server Error")
-            }
-        }
-
-        server.createContext("/apk/unload") { exchange ->
-            if (ResponseUtils.handleOptions(exchange)) return@createContext
-            try {
-                val params = ResponseUtils.parseRequestParams(exchange)
-                val apkId = extractApkId(exchange, params)
-                if (apkId.isNullOrEmpty()) {
-                    ResponseUtils.sendError(exchange, 400, "Missing required parameter 'apk_id'")
-                    return@createContext
-                }
-                val clearCache = params["clear_cache"]?.toBoolean() ?: false
-                val result = processManager.unloadApk(apkId, clearCache = clearCache)
-                ResponseUtils.sendSuccess(exchange, result)
-            } catch (e: IllegalArgumentException) {
-                ResponseUtils.sendError(exchange, 400, e.message ?: "Bad Request")
-            } catch (e: Exception) {
-                ResponseUtils.sendError(exchange, 500, e.message ?: "Internal Server Error")
-            }
-        }
-
-        // ==========================================
-        // 2. /domain/action domain query APIs
-        // ==========================================
-
-        val proxyHandler = { exchange: HttpExchange ->
+        val forbid = { exchange: HttpExchange ->
             if (!ResponseUtils.handleOptions(exchange)) {
-                if (engine.currentApkPath != null) {
-                    // Worker sub-process local handler
-                    handleLocalBusinessRequest(exchange)
-                } else {
-                    // Master node: extract apk_id for validation and transparent proxy
-                    val params = ResponseUtils.parseRequestParams(exchange)
-                    val apkId = extractApkId(exchange, params)
-
-                    if (apkId.isNullOrEmpty()) {
-                        ResponseUtils.sendError(exchange, 400, "Missing required parameter 'apk_id'")
-                    } else if (!processManager.isWorkerAlive(apkId)) {
-                        ResponseUtils.sendError(exchange, 404, "No running instance found for apk_id '$apkId'")
-                    } else {
-                        processManager.proxyToWorker(apkId, exchange)
-                    }
-                }
+                ResponseUtils.sendError(exchange, 403, "Worker does not expose /apk/*", "WORKER_FORBIDDEN")
             }
         }
+        server.createContext("/apk/load", forbid)
+        server.createContext("/apk/unload", forbid)
+        server.createContext("/apk/list", forbid)
 
-        // Meta domain
-        server.createContext("/meta/manifest", proxyHandler)
-        server.createContext("/meta/summary", proxyHandler)
-        server.createContext("/meta/classes", proxyHandler)
-        server.createContext("/meta/methods", proxyHandler)
-        server.createContext("/meta/fields", proxyHandler)
-        server.createContext("/meta/main-activity", proxyHandler)
-
-        // Decompile domain
-        server.createContext("/decompile/java", proxyHandler)
-        server.createContext("/decompile/smali", proxyHandler)
-        server.createContext("/decompile/method", proxyHandler)
-
-        // Resource domain
-        server.createContext("/resource/strings", proxyHandler)
-        server.createContext("/resource/list", proxyHandler)
-        server.createContext("/resource/file", proxyHandler)
-
-        // Xref domain
-        server.createContext("/xref/class", proxyHandler)
-        server.createContext("/xref/method", proxyHandler)
-        server.createContext("/xref/field", proxyHandler)
-
-        // Search domain
-        server.createContext("/search/classes", proxyHandler)
-        server.createContext("/search/method", proxyHandler)
+        val businessHandler = { exchange: HttpExchange ->
+            if (!ResponseUtils.handleOptions(exchange)) {
+                handleLocalBusinessRequest(exchange)
+            }
+        }
+        listOf(
+            "/meta/manifest", "/meta/summary", "/meta/classes", "/meta/methods", "/meta/fields", "/meta/main-activity",
+            "/decompile/java", "/decompile/smali", "/decompile/method",
+            "/resource/strings", "/resource/list", "/resource/file",
+            "/xref/class", "/xref/method", "/xref/field",
+            "/search/classes", "/search/method"
+        ).forEach { path -> server.createContext(path, businessHandler) }
 
         server.start()
-        println("Server successfully started on port $port")
+        log.info("Worker HTTP on 127.0.0.1:{}", port)
+        println("Worker HTTP 127.0.0.1:$port")
     }
 
-    private fun extractApkId(exchange: HttpExchange, params: Map<String, String>): String? {
-        val headerVal = exchange.requestHeaders.getFirst("X-Apk-Id")
-        if (!headerVal.isNullOrBlank()) {
-            return headerVal.trim()
+    fun stop() {
+        try {
+            httpServer?.stop(0)
+        } catch (e: Exception) {
+            log.warn("stop error: {}", e.message)
         }
-        val paramVal = params["apk_id"]
-        if (!paramVal.isNullOrBlank()) {
-            return paramVal.trim()
-        }
-        return null
     }
 
     private fun handleLocalBusinessRequest(exchange: HttpExchange) {
@@ -162,115 +82,183 @@ class JadxHttpServer(private val port: Int) {
         try {
             val params = ResponseUtils.parseRequestParams(exchange)
             when (path) {
-                "/meta/manifest" -> {
-                    ResponseUtils.sendSuccess(exchange, mapOf("content" to engine.getManifest()))
-                }
+                "/meta/manifest" -> ResponseUtils.sendSuccess(exchange, mapOf("content" to engine.getManifest()))
                 "/meta/summary" -> {
                     val activity = engine.getMainActivity()
-                    ResponseUtils.sendSuccess(exchange, mapOf(
-                        "classesCount" to engine.classesCount,
-                        "mainActivity" to (activity?.fullName ?: ""),
-                        "currentApkPath" to (engine.currentApkPath ?: "")
-                    ))
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf(
+                            "classesCount" to engine.classesCount,
+                            "mainActivity" to (activity?.fullName ?: ""),
+                            "currentApkPath" to (engine.currentApkPath ?: "")
+                        )
+                    )
                 }
                 "/meta/classes" -> {
-                    val offset = params["offset"]?.toIntOrNull() ?: 0
-                    val count = params["count"]?.toIntOrNull() ?: 50
+                    val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
+                    val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
                     val pkg = params["package"] ?: ""
                     val classes = if (pkg.isNotEmpty()) {
-                        engine.searchClassesByKeyword("", pkg, "class", offset, count)
+                        engine.getClassNamesByPackage(pkg, offset, count)
                     } else {
                         engine.getAllClassNames(offset, count)
                     }
-                    ResponseUtils.sendSuccess(exchange, mapOf("total" to engine.classesCount, "classes" to classes))
+                    val total = if (pkg.isNotEmpty()) engine.countClassesByPackage(pkg) else engine.classesCount
+                    ResponseUtils.sendSuccess(exchange, mapOf("total" to total, "classes" to classes))
                 }
                 "/meta/methods" -> {
                     val javaClass = engine.requireClass(params["class_name"])
-                    val methods = javaClass.methods.map { it.methodNode.methodInfo.shortId }
-                    ResponseUtils.sendSuccess(exchange, mapOf("class_name" to javaClass.fullName, "methods" to methods))
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf("class_name" to javaClass.fullName, "methods" to javaClass.methods.map { it.name })
+                    )
                 }
                 "/meta/fields" -> {
                     val javaClass = engine.requireClass(params["class_name"])
-                    val fields = javaClass.fields.map { it.fieldNode.fieldInfo.shortId }
-                    ResponseUtils.sendSuccess(exchange, mapOf("class_name" to javaClass.fullName, "fields" to fields))
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf("class_name" to javaClass.fullName, "fields" to javaClass.fields.map { it.name })
+                    )
                 }
                 "/meta/main-activity" -> {
                     val activityClass = engine.getMainActivity()
                     if (activityClass != null) {
-                        val timeout = params["timeout"]?.toLongOrNull()
-                        ResponseUtils.sendSuccess(exchange, mapOf("class_name" to activityClass.fullName, "code" to engine.getClassSource(activityClass, timeout)))
+                        val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                        ResponseUtils.sendSuccess(
+                            exchange,
+                            mapOf(
+                                "class_name" to activityClass.fullName,
+                                "code" to engine.getClassSource(activityClass, timeout)
+                            )
+                        )
                     } else {
-                        ResponseUtils.sendError(exchange, 404, "Main Activity not found")
+                        ResponseUtils.sendError(exchange, 404, "Main Activity not found", DecompileException.NOT_FOUND)
                     }
                 }
                 "/decompile/java" -> {
                     val javaClass = engine.requireClass(params["class_name"])
-                    val timeout = params["timeout"]?.toLongOrNull()
-                    val code = engine.getClassSource(javaClass, timeout)
-                    ResponseUtils.sendSuccess(exchange, mapOf("class_name" to javaClass.fullName, "code" to code))
+                    val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf("class_name" to javaClass.fullName, "code" to engine.getClassSource(javaClass, timeout))
+                    )
                 }
                 "/decompile/smali" -> {
                     val javaClass = engine.requireClass(params["class_name"])
-                    val smali = engine.getClassSmali(javaClass)
-                    ResponseUtils.sendSuccess(exchange, mapOf("class_name" to javaClass.fullName, "smali" to smali))
+                    val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf("class_name" to javaClass.fullName, "smali" to engine.getClassSmali(javaClass, timeout))
+                    )
                 }
                 "/decompile/method" -> {
-                    val methodName = requireNotNull(params["method_name"]) { "Missing 'method_name'" }
+                    val methodName = params["method_name"]
+                        ?: throw DecompileException(DecompileException.INVALID_ARGUMENT, "Missing 'method_name'", 400)
                     val javaClass = engine.requireClass(params["class_name"])
-                    val code = engine.getMethodSourceCode(javaClass, methodName)
-                    ResponseUtils.sendSuccess(exchange, mapOf("class_name" to javaClass.fullName, "method_name" to methodName, "code" to code))
+                    val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf(
+                            "class_name" to javaClass.fullName,
+                            "method_name" to methodName,
+                            "code" to engine.getMethodSourceCode(javaClass, methodName, timeout)
+                        )
+                    )
                 }
                 "/resource/strings" -> {
-                    val offset = params["offset"]?.toIntOrNull() ?: 0
-                    val count = params["count"]?.toIntOrNull() ?: 50
+                    val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
+                    val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
                     ResponseUtils.sendSuccess(exchange, mapOf("strings" to engine.getStrings(offset, count)))
                 }
                 "/resource/list" -> {
-                    val offset = params["offset"]?.toIntOrNull() ?: 0
-                    val count = params["count"]?.toIntOrNull() ?: 50
+                    val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
+                    val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
                     ResponseUtils.sendSuccess(exchange, mapOf("files" to engine.getAllResourceFileNames(offset, count)))
                 }
                 "/resource/file" -> {
                     val fileName = params["file_name"] ?: ""
-                    ResponseUtils.sendSuccess(exchange, mapOf("file_name" to fileName, "content" to engine.getResourceFile(fileName)))
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf("file_name" to fileName, "content" to engine.getResourceFile(fileName))
+                    )
                 }
                 "/xref/class" -> {
-                    val className = params["class_name"] ?: ""
-                    val offset = params["offset"]?.toIntOrNull() ?: 0
-                    val count = params["count"]?.toIntOrNull() ?: 50
-                    ResponseUtils.sendSuccess(exchange, mapOf("references" to engine.getXrefsToClass(className, offset, count)))
+                    val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf(
+                            "references" to engine.getXrefsToClass(
+                                params["class_name"] ?: "",
+                                params["offset"]?.toDoubleOrNull()?.toInt() ?: 0,
+                                params["count"]?.toDoubleOrNull()?.toInt() ?: 50,
+                                timeout
+                            )
+                        )
+                    )
                 }
                 "/xref/method" -> {
-                    val className = params["class_name"] ?: ""
-                    val methodName = params["method_name"] ?: ""
-                    val offset = params["offset"]?.toIntOrNull() ?: 0
-                    val count = params["count"]?.toIntOrNull() ?: 50
-                    ResponseUtils.sendSuccess(exchange, mapOf("references" to engine.getXrefsToMethod(className, methodName, offset, count)))
+                    val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf(
+                            "references" to engine.getXrefsToMethod(
+                                params["class_name"] ?: "",
+                                params["method_name"] ?: "",
+                                params["offset"]?.toDoubleOrNull()?.toInt() ?: 0,
+                                params["count"]?.toDoubleOrNull()?.toInt() ?: 50,
+                                timeout
+                            )
+                        )
+                    )
                 }
                 "/xref/field" -> {
-                    val className = params["class_name"] ?: ""
-                    val fieldName = params["field_name"] ?: ""
-                    val offset = params["offset"]?.toIntOrNull() ?: 0
-                    val count = params["count"]?.toIntOrNull() ?: 50
-                    ResponseUtils.sendSuccess(exchange, mapOf("references" to engine.getXrefsToField(className, fieldName, offset, count)))
+                    val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf(
+                            "references" to engine.getXrefsToField(
+                                params["class_name"] ?: "",
+                                params["field_name"] ?: "",
+                                params["offset"]?.toDoubleOrNull()?.toInt() ?: 0,
+                                params["count"]?.toDoubleOrNull()?.toInt() ?: 50,
+                                timeout
+                            )
+                        )
+                    )
                 }
                 "/search/classes" -> {
                     val term = params["search_term"] ?: ""
                     val pkg = params["package"] ?: ""
-                    val searchIn = params["search_in"] ?: "code"
-                    val offset = params["offset"]?.toIntOrNull() ?: 0
-                    val count = params["count"]?.toIntOrNull() ?: 50
-                    ResponseUtils.sendSuccess(exchange, mapOf("classes" to engine.searchClassesByKeyword(term, pkg, searchIn, offset, count)))
+                    val searchIn = params["search_in"] ?: "class"
+                    val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
+                    val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
+                    val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    val maxScan = params["max_scan"]?.toDoubleOrNull()?.toInt()
+                    val maxDecompile = params["max_decompile"]?.toDoubleOrNull()?.toInt()
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        engine.searchClassesByKeyword(term, pkg, searchIn, offset, count, timeout, maxScan, maxDecompile)
+                    )
                 }
                 "/search/method" -> {
                     val methodName = params["method_name"] ?: ""
-                    ResponseUtils.sendSuccess(exchange, mapOf("matches" to engine.searchMethodByName(methodName)))
+                    val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
+                    val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf("matches" to engine.searchMethodByName(methodName, offset, count))
+                    )
                 }
                 else -> ResponseUtils.sendError(exchange, 404, "Unknown endpoint: $path")
             }
+        } catch (e: DecompileException) {
+            ResponseUtils.sendDecompileError(exchange, e)
         } catch (e: IllegalArgumentException) {
             ResponseUtils.sendError(exchange, 400, e.message ?: "Bad Request")
+        } catch (e: IllegalStateException) {
+            ResponseUtils.sendError(exchange, 400, e.message ?: "Bad Request")
         } catch (e: Exception) {
+            log.error("Business handler error", e)
             ResponseUtils.sendError(exchange, 500, e.message ?: "Internal Server Error")
         }
     }

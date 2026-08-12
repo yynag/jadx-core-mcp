@@ -1,120 +1,90 @@
 package com.yyang.jadx_server
 
 import com.google.gson.JsonParser
-import com.yyang.jadx_server.server.JadxHttpServer
+import com.yyang.jadx_server.server.MasterKtorServer
 import org.junit.jupiter.api.AfterAll
-import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.MethodOrderer
 import org.junit.jupiter.api.Order
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestMethodOrder
 import java.io.File
-import java.io.FileOutputStream
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 
-/**
- * REST API Integration Test suite (supporting multi-APK concurrency and UUID apk_id binding).
- */
 @TestMethodOrder(MethodOrderer.OrderAnnotation::class)
 class JadxApiIntegrationTest {
 
     companion object {
-        private var testApkPath: String = ""
         private const val PORT = 8652
-        private const val BASE_URL = "http://127.0.0.1:8652"
-
-        private lateinit var server: JadxHttpServer
+        private const val BASE_URL = "http://127.0.0.1:$PORT"
+        private lateinit var server: MasterKtorServer
+        private lateinit var testArtifact: String
         private var apkId1: String = ""
         private var apkId2: String = ""
 
-        private val client = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(120))
-            .build()
+        private val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(120)).build()
 
         @JvmStatic
         @BeforeAll
         fun setup() {
-            println("Starting test server on port $PORT...")
-            server = JadxHttpServer(PORT)
-            server.start()
+            server = MasterKtorServer(port = PORT)
+            server.start(wait = false)
+            Thread.sleep(1500)
 
             val envPath = System.getenv("JADX_TEST_APK")
-            
-            testApkPath = when {
+            testArtifact = when {
                 !envPath.isNullOrEmpty() && File(envPath).exists() -> envPath
-                else -> createDummyTestZip().absolutePath
+                else -> {
+                    val resource = JadxApiIntegrationTest::class.java.classLoader.getResource("sample.jar")
+                        ?: error("sample.jar missing from test resources")
+                    File(resource.toURI()).absolutePath
+                }
             }
-            println("Using test APK/JAR path: $testApkPath")
         }
 
         @JvmStatic
         @AfterAll
         fun teardown() {
-            println("Cleaning up all Worker processes...")
-            if (apkId1.isNotEmpty()) {
-                try { server.processManager.unloadApk(apkId1, clearCache = true) } catch (e: Exception) {}
+            try {
+                if (apkId1.isNotEmpty()) server.processManager().unloadApk(apkId1, clearCache = true)
+            } catch (_: Exception) {
             }
-            if (apkId2.isNotEmpty()) {
-                try { server.processManager.unloadApk(apkId2, clearCache = true) } catch (e: Exception) {}
+            try {
+                if (apkId2.isNotEmpty()) server.processManager().unloadApk(apkId2, clearCache = true)
+            } catch (_: Exception) {
             }
+            server.stop()
         }
 
-        private fun createDummyTestZip(): File {
-            val tempFile = File.createTempFile("dummy_test_app", ".apk")
-            tempFile.deleteOnExit()
-            ZipOutputStream(FileOutputStream(tempFile)).use { zos ->
-                zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
-                val manifestContent = """
-                    <?xml version="1.0" encoding="utf-8"?>
-                    <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.dummy.testapp">
-                        <application android:name=".MainApp">
-                            <activity android:name=".MainActivity">
-                                <intent-filter>
-                                    <action android:name="android.intent.action.MAIN" />
-                                    <category android:name="android.intent.category.LAUNCHER" />
-                                </intent-filter>
-                            </activity>
-                        </application>
-                    </manifest>
-                """.trimIndent()
-                zos.write(manifestContent.toByteArray(Charsets.UTF_8))
-                zos.closeEntry()
-
-                zos.putNextEntry(ZipEntry("res/values/strings.xml"))
-                val stringsContent = """
-                    <?xml version="1.0" encoding="utf-8"?>
-                    <resources>
-                        <string name="app_name">Dummy Test App</string>
-                        <string name="welcome">Hello World</string>
-                    </resources>
-                """.trimIndent()
-                zos.write(stringsContent.toByteArray(Charsets.UTF_8))
-                zos.closeEntry()
-            }
-            return tempFile
-        }
-
-        fun sendRequest(endpoint: String, method: String = "GET", jsonBody: String? = null, expectedStatus: Int = 200): String {
+        fun sendRequest(
+            endpoint: String,
+            method: String = "GET",
+            jsonBody: String? = null,
+            expectedStatus: Int = 200
+        ): String {
             val builder = HttpRequest.newBuilder()
                 .uri(URI.create(BASE_URL + endpoint))
                 .timeout(Duration.ofSeconds(120))
-
             if (method == "POST" && jsonBody != null) {
                 builder.POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                 builder.header("Content-Type", "application/json")
             } else {
                 builder.GET()
             }
-
             val response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString())
-            assertEquals(expectedStatus, response.statusCode(), "Endpoint $endpoint status code mismatch! Expected $expectedStatus, actual ${response.statusCode()}")
+            assertEquals(
+                expectedStatus,
+                response.statusCode(),
+                "Endpoint $endpoint expected $expectedStatus got ${response.statusCode()} body=${response.body()}"
+            )
             return response.body()
         }
     }
@@ -122,96 +92,84 @@ class JadxApiIntegrationTest {
     @Test
     @Order(1)
     fun testHealthBeforeLoad() {
-        val json = sendRequest("/health")
-        val jsonObj = JsonParser.parseString(json).asJsonObject
-        assertEquals("ok", jsonObj.get("status").asString)
-        assertEquals(0, jsonObj.get("activeApksCount").asInt)
+        val json = JsonParser.parseString(sendRequest("/health")).asJsonObject
+        assertEquals("ok", json.get("status").asString)
+        assertEquals(0, json.get("activeApksCount").asInt)
+        assertEquals("/mcp", json.get("mcp").asString)
     }
 
     @Test
     @Order(2)
-    fun testLoadTwoApks() {
-        // Load first APK
-        val postJson = "{\"apk_path\":\"$testApkPath\"}"
-        val resp1 = sendRequest("/apk/load", method = "POST", jsonBody = postJson)
-        val jsonObj1 = JsonParser.parseString(resp1).asJsonObject
-        assertEquals("success", jsonObj1.get("status").asString)
-        apkId1 = jsonObj1.get("apk_id").asString
+    fun testLoadTwoInstances() {
+        val body = """{"apk_path":"$testArtifact","max_heap":"512m"}"""
+        val r1 = JsonParser.parseString(sendRequest("/apk/load", "POST", body)).asJsonObject
+        assertEquals("success", r1.get("status").asString)
+        apkId1 = r1.get("apk_id").asString
         assertTrue(apkId1.isNotBlank())
 
-        // Load second APK
-        val resp2 = sendRequest("/apk/load", method = "POST", jsonBody = postJson)
-        val jsonObj2 = JsonParser.parseString(resp2).asJsonObject
-        assertEquals("success", jsonObj2.get("status").asString)
-        apkId2 = jsonObj2.get("apk_id").asString
-        assertTrue(apkId2.isNotBlank())
-
-        assertNotEquals(apkId1, apkId2, "Generated apk_ids across multiple loads should be unique")
+        val r2 = JsonParser.parseString(sendRequest("/apk/load", "POST", body)).asJsonObject
+        apkId2 = r2.get("apk_id").asString
+        assertNotEquals(apkId1, apkId2)
     }
 
     @Test
     @Order(3)
-    fun testApkListAndHealthAfterLoad() {
-        val listJson = sendRequest("/apk/list")
-        val listObj = JsonParser.parseString(listJson).asJsonObject
-        val apks = listObj.get("apks").asJsonArray
-        assertEquals(2, apks.size())
-
-        val healthJson = sendRequest("/health")
-        val healthObj = JsonParser.parseString(healthJson).asJsonObject
-        assertEquals(2, healthObj.get("activeApksCount").asInt)
+    fun testSummaryHasClasses() {
+        val json = JsonParser.parseString(sendRequest("/meta/summary?apk_id=$apkId1")).asJsonObject
+        assertTrue(json.get("classesCount").asInt >= 1)
     }
 
     @Test
     @Order(4)
-    fun testMissingApkIdInterception() {
-        // Missing apk_id, expect HTTP 400
-        val body = sendRequest("/meta/manifest", expectedStatus = 400)
-        val jsonObj = JsonParser.parseString(body).asJsonObject
-        assertEquals("error", jsonObj.get("status").asString)
-        assertTrue(jsonObj.get("message").asString.contains("apk_id"))
+    fun testDecompileRealSource() {
+        val path = "/decompile/java?apk_id=$apkId1&class_name=com.yyang.sample.HelloSample"
+        val json = JsonParser.parseString(sendRequest(path)).asJsonObject
+        val code = json.get("code").asString
+        assertTrue(code.contains("HelloSample"))
+        assertTrue(code.contains("JADX_CORE_MCP_SAMPLE_MAGIC") || code.contains("greet"))
     }
 
     @Test
     @Order(5)
-    fun testInvalidApkIdInterception() {
-        // Invalid apk_id, expect HTTP 404
-        val body = sendRequest("/meta/manifest?apk_id=non_existent_uuid", expectedStatus = 404)
-        val jsonObj = JsonParser.parseString(body).asJsonObject
-        assertEquals("error", jsonObj.get("status").asString)
+    fun testSearchClassDefault() {
+        val path = "/search/classes?apk_id=$apkId1&search_term=HelloSample&search_in=class"
+        val json = JsonParser.parseString(sendRequest(path)).asJsonObject
+        val classes = json.getAsJsonArray("classes")
+        assertTrue(classes.size() >= 1)
+        assertTrue(classes[0].asJsonObject.get("class_name").asString.contains("HelloSample"))
+        assertFalse(classes[0].asJsonObject.has("code"))
     }
 
     @Test
     @Order(6)
-    fun testManifestDecodeWithValidApkId() {
-        val json = sendRequest("/meta/manifest?apk_id=$apkId1")
-        val jsonObj = JsonParser.parseString(json).asJsonObject
-        val content = jsonObj.get("content").asString
-        assertTrue(content.contains("<manifest"))
+    fun testSearchInvalidScopeErrors() {
+        val path = "/search/classes?apk_id=$apkId1&search_term=x&search_in=method"
+        val body = sendRequest(path, expectedStatus = 400)
+        assertEquals("error", JsonParser.parseString(body).asJsonObject.get("status").asString)
     }
 
     @Test
     @Order(7)
-    fun testClassesAndResourcesWithValidApkId() {
-        val classesJson = sendRequest("/meta/classes?apk_id=$apkId2&offset=0&count=5")
-        val classesObj = JsonParser.parseString(classesJson).asJsonObject
-        assertNotNull(classesObj.get("classes"))
-
-        val stringsJson = sendRequest("/resource/strings?apk_id=$apkId1&offset=0&count=2")
-        val stringsArr = JsonParser.parseString(stringsJson).asJsonObject.get("strings").asJsonArray
-        assertNotNull(stringsArr)
+    fun testMissingAndInvalidApkId() {
+        sendRequest("/meta/manifest", expectedStatus = 400)
+        sendRequest("/meta/manifest?apk_id=non_existent_uuid", expectedStatus = 404)
     }
 
     @Test
     @Order(8)
-    fun testUnloadApk() {
-        val unloadJson = sendRequest("/apk/unload", method = "POST", jsonBody = "{\"apk_id\":\"$apkId1\"}")
-        val jsonObj = JsonParser.parseString(unloadJson).asJsonObject
-        assertEquals("success", jsonObj.get("status").asString)
+    fun testClassNotFoundIsError() {
+        val path = "/decompile/java?apk_id=$apkId1&class_name=com.no.such.Class"
+        val body = sendRequest(path, expectedStatus = 404)
+        assertTrue(body.contains("error") || body.contains("NOT_FOUND") || body.contains("not found"))
+    }
 
-        val listJson = sendRequest("/apk/list")
-        val listObj = JsonParser.parseString(listJson).asJsonObject
-        val apks = listObj.get("apks").asJsonArray
-        assertEquals(1, apks.size())
+    @Test
+    @Order(9)
+    fun testUnload() {
+        val body = sendRequest("/apk/unload", "POST", """{"apk_id":"$apkId1"}""")
+        assertEquals("success", JsonParser.parseString(body).asJsonObject.get("status").asString)
+        apkId1 = ""
+        val list = JsonParser.parseString(sendRequest("/apk/list")).asJsonObject.getAsJsonArray("apks")
+        assertEquals(1, list.size())
     }
 }

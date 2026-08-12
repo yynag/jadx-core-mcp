@@ -2,118 +2,124 @@ package com.yyang.jadx_server.cache
 
 import java.io.File
 import java.lang.ref.SoftReference
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Manages disk and memory caching for decompiled Java source code and Smali bytecodes.
- * Aligned with JADX-GUI Code Cache strategy supporting DISK_WITH_CACHE, MEMORY, and DISK modes.
- * Employs SoftReference to protect JVM heap memory, allowing automatic GC eviction under memory pressure.
+ * WHY:
+ * 1) 同路径多 Worker 共享 `{apkName}_jadx_cache` 会并发写撕裂源码；
+ * 2) className 直接拼路径存在 `../` 穿越面；
+ * 3) 无内容指纹时换包同名会读到脏缓存。
+ * DECISION: soft+disk 固定两级；目录 = 主文件旁 + apk版本 + 实例隔离键 + 文件指纹；类名白名单 + normalize 校验。
+ * EVIDENCE: 审查 K1/K2/L6；进程隔离卸载靠杀 JVM，磁盘缓存仍需按实例隔离。
  */
 class JadxCacheManager(
-    private val targetFile: File,
-    var mode: CodeCacheMode = CodeCacheMode.DISK_WITH_CACHE
+    targetFile: File,
+    /** Worker 实例隔离键（通常为 apk_id），避免同路径多开互写 */
+    instanceKey: String,
+    jadxVersion: String = "1.5.6"
 ) {
+    val cacheDir: File
 
-    private val cacheDir: File
-
-    /** Memory soft-reference cache to prevent OOM during deep decompilation */
     private val memorySourceCache = ConcurrentHashMap<String, SoftReference<String>>()
     private val memorySmaliCache = ConcurrentHashMap<String, SoftReference<String>>()
 
     init {
         val parent = targetFile.parentFile ?: File(".")
-        cacheDir = File(parent, "${targetFile.name}_jadx_cache")
+        val fingerprint = fileFingerprint(targetFile)
+        val safeInstance = instanceKey.replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "default" }
+        // 结构: {apkName}_jadx_cache/jadx-{ver}/{instance}/{fingerprint}/
+        cacheDir = File(
+            parent,
+            "${targetFile.name}_jadx_cache${File.separator}jadx-$jadxVersion${File.separator}$safeInstance${File.separator}$fingerprint"
+        )
         if (!cacheDir.exists()) {
             cacheDir.mkdirs()
         }
     }
 
-    private fun getSourceFile(className: String): File {
-        val path = className.replace('.', File.separatorChar) + ".java"
-        return File(File(cacheDir, "sources"), path)
+    companion object {
+        private val SAFE_CLASS_NAME = Regex("^[A-Za-z0-9_.$]+$")
+
+        fun fileFingerprint(file: File): String {
+            if (!file.exists() || !file.isFile) return "nofile"
+            return "${file.length()}_${file.lastModified()}"
+        }
+
+        /**
+         * Master unload(clear_cache) 时按主文件名删除整个 `{name}_jadx_cache` 根目录。
+         * WHY: Worker 内指纹子目录 Master 不一定知道；整树删除最简单且与「用户要求清缓存」语义一致。
+         */
+        fun resolveCacheRoot(apkPath: String): File {
+            val file = File(apkPath)
+            val parent = file.parentFile ?: File(".")
+            return File(parent, "${file.name}_jadx_cache")
+        }
     }
 
-    private fun getSmaliFile(className: String): File {
-        val path = className.replace('.', File.separatorChar) + ".smali"
-        return File(File(cacheDir, "smali"), path)
+    private fun assertSafeClassName(className: String) {
+        require(SAFE_CLASS_NAME.matches(className)) {
+            "Unsafe class name for cache path: $className"
+        }
     }
 
-    /**
-     * Retrieve Java source cache using soft references and disk fallback.
-     */
+    private fun resolveUnderCache(subDir: String, className: String, ext: String): File {
+        assertSafeClassName(className)
+        val relative = className.replace('.', File.separatorChar) + ext
+        val base = File(cacheDir, subDir).canonicalFile
+        val target = File(base, relative).canonicalFile
+        require(target.path.startsWith(base.path + File.separator) || target.path == base.path) {
+            "Cache path escape detected for class: $className"
+        }
+        return target
+    }
+
+    private fun getSourceFile(className: String): File = resolveUnderCache("sources", className, ".java")
+
+    private fun getSmaliFile(className: String): File = resolveUnderCache("smali", className, ".smali")
+
+    private fun atomicWrite(file: File, text: String) {
+        file.parentFile?.mkdirs()
+        val tmp = File(file.parentFile, "${file.name}.tmp.${ProcessHandle.current().pid()}")
+        tmp.writeText(text, Charsets.UTF_8)
+        try {
+            Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        } catch (_: Exception) {
+            Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+
     fun getCachedSource(className: String): String? {
-        if (mode == CodeCacheMode.MEMORY || mode == CodeCacheMode.DISK_WITH_CACHE) {
-            val ref = memorySourceCache[className]
-            val code = ref?.get()
-            if (code != null) return code
+        memorySourceCache[className]?.get()?.let { return it }
+        val f = getSourceFile(className)
+        if (f.exists()) {
+            val text = f.readText(Charsets.UTF_8)
+            memorySourceCache[className] = SoftReference(text)
+            return text
         }
-
-        if (mode == CodeCacheMode.DISK || mode == CodeCacheMode.DISK_WITH_CACHE) {
-            val f = getSourceFile(className)
-            if (f.exists()) {
-                val text = f.readText(Charsets.UTF_8)
-                if (mode == CodeCacheMode.DISK_WITH_CACHE) {
-                    memorySourceCache[className] = SoftReference(text)
-                }
-                return text
-            }
-        }
-
         return null
     }
 
-    /**
-     * Write Java source code to cache.
-     */
     fun saveCachedSource(className: String, code: String) {
-        if (mode == CodeCacheMode.MEMORY || mode == CodeCacheMode.DISK_WITH_CACHE) {
-            memorySourceCache[className] = SoftReference(code)
-        }
-
-        if (mode == CodeCacheMode.DISK || mode == CodeCacheMode.DISK_WITH_CACHE) {
-            val f = getSourceFile(className)
-            f.parentFile?.mkdirs()
-            f.writeText(code, Charsets.UTF_8)
-        }
+        memorySourceCache[className] = SoftReference(code)
+        atomicWrite(getSourceFile(className), code)
     }
 
-    /**
-     * Retrieve Smali bytecode cache.
-     */
     fun getCachedSmali(className: String): String? {
-        if (mode == CodeCacheMode.MEMORY || mode == CodeCacheMode.DISK_WITH_CACHE) {
-            val ref = memorySmaliCache[className]
-            val smali = ref?.get()
-            if (smali != null) return smali
+        memorySmaliCache[className]?.get()?.let { return it }
+        val f = getSmaliFile(className)
+        if (f.exists()) {
+            val text = f.readText(Charsets.UTF_8)
+            memorySmaliCache[className] = SoftReference(text)
+            return text
         }
-
-        if (mode == CodeCacheMode.DISK || mode == CodeCacheMode.DISK_WITH_CACHE) {
-            val f = getSmaliFile(className)
-            if (f.exists()) {
-                val text = f.readText(Charsets.UTF_8)
-                if (mode == CodeCacheMode.DISK_WITH_CACHE) {
-                    memorySmaliCache[className] = SoftReference(text)
-                }
-                return text
-            }
-        }
-
         return null
     }
 
-    /**
-     * Write Smali bytecode to cache.
-     */
     fun saveCachedSmali(className: String, smali: String) {
-        if (mode == CodeCacheMode.MEMORY || mode == CodeCacheMode.DISK_WITH_CACHE) {
-            memorySmaliCache[className] = SoftReference(smali)
-        }
-
-        if (mode == CodeCacheMode.DISK || mode == CodeCacheMode.DISK_WITH_CACHE) {
-            val f = getSmaliFile(className)
-            f.parentFile?.mkdirs()
-            f.writeText(smali, Charsets.UTF_8)
-        }
+        memorySmaliCache[className] = SoftReference(smali)
+        atomicWrite(getSmaliFile(className), smali)
     }
 
     fun clearCache() {

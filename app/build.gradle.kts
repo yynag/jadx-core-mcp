@@ -1,60 +1,43 @@
 /*
- * JADX Headless Server (jadx-core-mcp) subproject Gradle build configuration.
- * Includes Kotlin JVM setup, JADX core SDK dependencies, and Shadow Fat-JAR packaging task.
+ * JADX Headless Server Gradle build.
  */
 
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 
 plugins {
-    // Kotlin JVM plugin
     alias(libs.plugins.kotlin.jvm)
-
-    // Application plugin to build Java/Kotlin CLI application
     application
-    
-    // Shadow plugin to build standalone executable Fat-JAR
     id("com.gradleup.shadow") version "8.3.6"
 }
 
 repositories {
-    // Aliyun Maven repository mirrors for faster dependency downloads
     maven { url = uri("https://maven.aliyun.com/repository/public") }
     maven { url = uri("https://maven.aliyun.com/repository/google") }
-    maven { url = uri("https://maven.aliyun.com/repository/jcenter") }
-    // Maven Central & Google fallback repositories
     mavenCentral()
     google()
 }
 
 dependencies {
-    // Kotlin Test integration
     testImplementation("org.jetbrains.kotlin:kotlin-test")
-
-    // JUnit 5 test engine integration
     testImplementation(libs.junit.jupiter.engine)
-
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 
-    // Guava utilities
-    implementation(libs.guava)
-    
-    // JADX Core SDK and input plugin dependencies
     implementation(libs.jadx.core)
     implementation(libs.jadx.dex.input)
     implementation(libs.jadx.java.input)
     implementation(libs.jadx.smali.input)
-    
-    // Gson JSON library
     implementation(libs.gson)
-    
-    // Logback logging framework (file appender & rotation)
     implementation(libs.logback.classic)
-    
-    // Model Context Protocol official Kotlin SDK
     implementation(libs.mcp.kotlin.sdk)
+
+    // WHY: OpenCode type=remote 需要 MCP Streamable HTTP；kotlin-sdk 的 mcpStreamableHttp 依赖 Ktor
+    implementation(libs.ktor.server.netty)
+    implementation(libs.ktor.server.sse)
+    implementation(libs.ktor.server.content.negotiation)
+    implementation(libs.ktor.serialization.kotlinx.json)
+    implementation(libs.ktor.server.cors)
 }
 
-// Configure JVM Toolchain for JDK 21 environment
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(21)
@@ -62,19 +45,14 @@ java {
 }
 
 application {
-    // Specify CLI application main class entrypoint
     mainClass.set("com.yyang.jadx_server.MainKt")
 }
 
 tasks.named<Test>("test") {
-    // Use JUnit Platform for unit tests
     useJUnitPlatform()
-    
-    // Increase heap size for test runner to prevent OOM when decompiling large APKs
     maxHeapSize = "4G"
 }
 
 tasks.withType<ShadowJar> {
-    // Merge ServiceLoader SPI descriptor files (critical for loading jadx plugins)
     mergeServiceFiles()
 }
