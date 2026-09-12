@@ -143,9 +143,76 @@ class JadxApiIntegrationTest {
     @Test
     @Order(6)
     fun testSearchInvalidScopeErrors() {
-        val path = "/search/classes?apk_id=$apkId1&search_term=x&search_in=method"
+        val path = "/search/classes?apk_id=$apkId1&search_term=x&search_in=bogus"
         val body = sendRequest(path, expectedStatus = 400)
         assertEquals("error", JsonParser.parseString(body).asJsonObject.get("status").asString)
+    }
+
+    @Test
+    @Order(6)
+    fun testSearchMethodAndFieldAndSignatures() {
+        val methods = JsonParser.parseString(
+            sendRequest("/meta/methods?apk_id=$apkId1&class_name=com.yyang.sample.HelloSample")
+        ).asJsonObject.getAsJsonArray("methods")
+        assertTrue(methods.size() >= 2)
+        val names = methods.map { it.asJsonObject.get("name").asString }
+        assertTrue(names.contains("greet"))
+        assertTrue(methods[0].asJsonObject.has("full_name"))
+
+        val methodSearch = JsonParser.parseString(
+            sendRequest("/search/method?apk_id=$apkId1&method_name=greet")
+        ).asJsonObject
+        assertTrue(methodSearch.get("matched_total").asInt >= 1)
+        assertTrue(
+            methodSearch.getAsJsonArray("matches").any { el ->
+                el.asJsonObject.get("class_name").asString.contains("HelloSample")
+            }
+        )
+
+        val fieldSearch = JsonParser.parseString(
+            sendRequest("/search/field?apk_id=$apkId1&search_term=MAGIC")
+        ).asJsonObject
+        assertTrue(fieldSearch.get("matched_total").asInt >= 1)
+
+        val xref = JsonParser.parseString(
+            sendRequest("/xref/class?apk_id=$apkId1&class_name=com.yyang.sample.HelloSample")
+        ).asJsonObject
+        assertTrue(xref.has("references"))
+
+        val summary = JsonParser.parseString(sendRequest("/meta/summary?apk_id=$apkId1")).asJsonObject
+        assertTrue(summary.has("topPackages"))
+
+        val classPreview = JsonParser.parseString(
+            sendRequest("/search/classes?apk_id=$apkId1&search_term=HelloSample&search_in=class")
+        ).asJsonObject.getAsJsonArray("classes")[0].asJsonObject
+        assertTrue(classPreview.has("preview"))
+
+        val strSearch = JsonParser.parseString(
+            sendRequest("/search/string?apk_id=$apkId1&search_term=JADX_CORE_MCP_SAMPLE_MAGIC")
+        ).asJsonObject
+        assertTrue(strSearch.has("matched_total"))
+        if (strSearch.get("matched_total").asInt >= 1) {
+            val first = strSearch.getAsJsonArray("classes")[0].asJsonObject
+            assertTrue(first.has("preview"))
+            assertTrue(first.get("class_name").asString.contains("HelloSample"))
+        }
+        val strAgain = JsonParser.parseString(
+            sendRequest("/search/string?apk_id=$apkId1&search_term=JADX_CORE_MCP_SAMPLE_MAGIC")
+        ).asJsonObject
+        assertTrue(strAgain.get("from_cache").asBoolean)
+
+        val renamed = JsonParser.parseString(
+            sendRequest(
+                "/rename?apk_id=$apkId1&target_type=method&class_name=com.yyang.sample.HelloSample&name=greet&new_name=sayHello"
+            )
+        ).asJsonObject
+        assertEquals("success", renamed.get("status").asString)
+        val after = JsonParser.parseString(
+            sendRequest("/meta/methods?apk_id=$apkId1&class_name=com.yyang.sample.HelloSample")
+        ).asJsonObject.getAsJsonArray("methods")
+        val methodNames = after.map { it.asJsonObject.get("name").asString }
+        assertTrue(methodNames.contains("sayHello"))
+        assertTrue(renamed.get("persisted").asBoolean)
     }
 
     @Test

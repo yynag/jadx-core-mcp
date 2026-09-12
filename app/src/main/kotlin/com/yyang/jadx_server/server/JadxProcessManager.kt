@@ -137,7 +137,7 @@ class JadxProcessManager {
         }
     }
 
-    fun loadApk(apkPath: String, maxHeap: String? = null): Map<String, Any> {
+    fun loadApk(apkPath: String, maxHeap: String? = null, deobf: Boolean = true): Map<String, Any> {
         val file = validateApkPath(apkPath)
         val apkId: String
         val port: Int
@@ -171,7 +171,8 @@ class JadxProcessManager {
                 "--apk", apkPath,
                 "--port", port.toString(),
                 "--apk-id", apkId,
-                "--master-pid", masterPid.toString()
+                "--master-pid", masterPid.toString(),
+                "--deobf", deobf.toString()
             )
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(workerLogFile))
             pb.redirectError(ProcessBuilder.Redirect.appendTo(workerLogFile))
@@ -233,7 +234,8 @@ class JadxProcessManager {
             "status" to "success",
             "apk_id" to apkId,
             "apk_path" to apkPath,
-            "worker_port" to port
+            "worker_port" to port,
+            "deobf" to deobf
         )
     }
 

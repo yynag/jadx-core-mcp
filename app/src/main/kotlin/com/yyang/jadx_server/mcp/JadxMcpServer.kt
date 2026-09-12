@@ -94,20 +94,27 @@ class JadxMcpServer(
         val timeoutP = "timeout" to ("number" to "Per-call timeout seconds (Agent decides). Server hard-cap applies.")
         val offsetP = "offset" to ("number" to "Pagination offset (default 0)")
         val countP = "count" to ("number" to "Page size (default 50)")
-        val maxScanP = "max_scan" to ("number" to "Max classes to scan in one search (default 500)")
+        val maxScanP = "max_scan" to ("number" to "Max classes to scan for code/comment (default 500). class/method/field ignore this and scan all.")
         val maxDecompP = "max_decompile" to ("number" to "Max on-demand decompiles for scope=code (default 50)")
 
         return listOf(
             ToolDef(
                 name = "apk_load",
-                description = "Load APK into isolated Worker JVM; returns apk_id. On OOM/failure, message lists active instances — call apk_unload to free memory.",
+                description = "Load APK into isolated Worker JVM; returns apk_id. Then: meta_summary → search (string/class) → xref → decompile (prefer target=method, timeout=90 for big classes).",
                 properties = mapOf(
                     "apk_path" to ("string" to "Absolute path to APK/DEX/JAR on the server host"),
-                    "max_heap" to ("string" to "Optional Worker heap e.g. 4g (Agent may set per APK size)")
+                    "max_heap" to ("string" to "Optional Worker heap e.g. 4g (Agent may set per APK size)"),
+                    "deobf" to ("boolean" to "Enable JADX deobfuscation (default true, matches GUI unique names)")
                 ),
                 required = listOf("apk_path"),
                 handler = { args ->
-                    gson.toJson(processManager.loadApk(requireArg(args, "apk_path"), argString(args, "max_heap")))
+                    gson.toJson(
+                        processManager.loadApk(
+                            requireArg(args, "apk_path"),
+                            argString(args, "max_heap"),
+                            argBool(args, "deobf") ?: true
+                        )
+                    )
                 }
             ),
             ToolDef(
@@ -131,25 +138,40 @@ class JadxMcpServer(
             ),
             ToolDef(
                 name = "meta_summary",
-                description = "APK summary: classesCount, mainActivity, path.",
+                description = "APK summary: classesCount, mainActivity, mainPackage, deobf, topPackages. Start here after apk_load.",
                 properties = mapOf(apkIdP),
                 required = listOf("apk_id"),
                 handler = { args -> workerGet(requireArg(args, "apk_id"), "/meta/summary") }
             ),
             ToolDef(
                 name = "meta_manifest",
-                description = "Decoded AndroidManifest.xml text.",
-                properties = mapOf(apkIdP),
+                description = "Decoded AndroidManifest.xml, or component list when component_type is set (activity|service|receiver|provider).",
+                properties = mapOf(
+                    apkIdP,
+                    "component_type" to ("string" to "activity | service | receiver | provider; omit for full XML"),
+                    "only_exported" to ("boolean" to "When listing components, keep exported only (default false)")
+                ),
                 required = listOf("apk_id"),
-                handler = { args -> workerGet(requireArg(args, "apk_id"), "/meta/manifest") }
+                handler = { args ->
+                    val apkId = requireArg(args, "apk_id")
+                    val type = argString(args, "component_type")
+                    if (!type.isNullOrBlank()) {
+                        val params = mutableMapOf("component_type" to type)
+                        argBool(args, "only_exported")?.let { params["only_exported"] = it.toString() }
+                        workerGet(apkId, "/meta/components", params)
+                    } else {
+                        workerGet(apkId, "/meta/manifest")
+                    }
+                }
             ),
             ToolDef(
                 name = "meta_class",
-                description = "Without class_name: paginated FQCN list. With class_name: methods+fields names.",
+                description = "Without class_name: paginated FQCN list (package or main_app=true). With class_name: methods+fields with signatures.",
                 properties = mapOf(
                     apkIdP,
-                    "class_name" to ("string" to "FQCN"),
+                    "class_name" to ("string" to "FQCN (also accepts p000./defpackage. aliases)"),
                     "package" to ("string" to "Package filter when listing"),
+                    "main_app" to ("boolean" to "List classes in manifest package"),
                     offsetP, countP
                 ),
                 required = listOf("apk_id"),
@@ -161,10 +183,11 @@ class JadxMcpServer(
                         val fields = workerGet(apkId, "/meta/fields", mutableMapOf("class_name" to className))
                         val m = gson.fromJson(methods, Map::class.java)
                         val f = gson.fromJson(fields, Map::class.java)
-                        gson.toJson(mapOf("class_name" to className, "methods" to m["methods"], "fields" to f["fields"]))
+                        gson.toJson(mapOf("class_name" to (m["class_name"] ?: className), "methods" to m["methods"], "fields" to f["fields"]))
                     } else {
                         val params = mutableMapOf<String, String>()
                         argString(args, "package")?.let { params["package"] = it }
+                        argBool(args, "main_app")?.let { params["main_app"] = it.toString() }
                         argInt(args, "offset")?.let { params["offset"] = it.toString() }
                         argInt(args, "count")?.let { params["count"] = it.toString() }
                         workerGet(apkId, "/meta/classes", params)
@@ -173,7 +196,7 @@ class JadxMcpServer(
             ),
             ToolDef(
                 name = "decompile",
-                description = "On-demand decompile. target=java|smali|method|main_activity. Failures set isError (never fake source).",
+                description = "On-demand decompile. target=java|smali|method|main_activity. Prefer method. Large class: timeout=90. Output truncated at 80k chars.",
                 properties = mapOf(
                     apkIdP,
                     "target" to ("string" to "java | smali | method | main_activity (default java)"),
@@ -208,11 +231,12 @@ class JadxMcpServer(
             ),
             ToolDef(
                 name = "resource",
-                description = "action=list|file|strings. Missing file → error.",
+                description = "action=list|file|strings|id. id looks up 0x7f... resource names.",
                 properties = mapOf(
                     apkIdP,
-                    "action" to ("string" to "list | file | strings (default list)"),
+                    "action" to ("string" to "list | file | strings | id (default list)"),
                     "file_name" to ("string" to "For action=file"),
+                    "id" to ("string" to "For action=id, e.g. 0x7f140000"),
                     offsetP, countP
                 ),
                 required = listOf("apk_id"),
@@ -229,13 +253,17 @@ class JadxMcpServer(
                             params["file_name"] = requireArg(args, "file_name")
                             workerGet(apkId, "/resource/file", params)
                         }
-                        else -> throw IllegalArgumentException("action must be list|file|strings")
+                        "id" -> {
+                            params["id"] = argString(args, "id") ?: requireArg(args, "file_name")
+                            workerGet(apkId, "/resource/id", params)
+                        }
+                        else -> throw IllegalArgumentException("action must be list|file|strings|id")
                     }
                 }
             ),
             ToolDef(
                 name = "xref",
-                description = "Cross-references. target_type=class|method|field.",
+                description = "Cross-references. Returns class_name, method, code_snippet; method_code when small. Field snippets skip declarations.",
                 properties = mapOf(
                     apkIdP,
                     "target_type" to ("string" to "class | method | field"),
@@ -268,14 +296,14 @@ class JadxMcpServer(
             ),
             ToolDef(
                 name = "search",
-                description = "scope=class (default)|code|method_name. code is budgeted via timeout/max_scan/max_decompile (Agent sets). Results are class names only.",
+                description = "scope=class|method_name|field|string|code|comment. Prefer string (DEX const, fast) then class. Hits include preview line. code/comment are budgeted.",
                 properties = mapOf(
                     apkIdP,
-                    "scope" to ("string" to "class | code | method_name (default class)"),
-                    "search_term" to ("string" to "Keyword for class/code"),
+                    "scope" to ("string" to "class | string | code | method_name | field | comment (default class)"),
+                    "search_term" to ("string" to "Keyword"),
                     "method_name" to ("string" to "For scope=method_name"),
                     "package" to ("string" to "Optional package filter"),
-                    "search_in" to ("string" to "Alias of scope for class/code"),
+                    "search_in" to ("string" to "Alias of scope"),
                     maxScanP, maxDecompP,
                     offsetP, countP, timeoutP
                 ),
@@ -289,6 +317,7 @@ class JadxMcpServer(
                     argLong(args, "timeout")?.let { params["timeout"] = it.toString() }
                     argInt(args, "max_scan")?.let { params["max_scan"] = it.toString() }
                     argInt(args, "max_decompile")?.let { params["max_decompile"] = it.toString() }
+                    argString(args, "package")?.let { params["package"] = it }
                     when (scope) {
                         "method_name", "method" -> {
                             params["method_name"] = argString(args, "method_name")
@@ -296,14 +325,42 @@ class JadxMcpServer(
                                 ?: throw IllegalArgumentException("method_name or search_term required")
                             workerGet(apkId, "/search/method", params)
                         }
-                        "class", "code" -> {
+                        "field" -> {
+                            params["search_term"] = requireArg(args, "search_term")
+                            workerGet(apkId, "/search/field", params)
+                        }
+                        "string" -> {
+                            params["search_term"] = requireArg(args, "search_term")
+                            workerGet(apkId, "/search/string", params, timeoutSec = 180)
+                        }
+                        "class", "code", "comment" -> {
                             params["search_term"] = requireArg(args, "search_term")
                             params["search_in"] = scope
-                            argString(args, "package")?.let { params["package"] = it }
                             workerGet(apkId, "/search/classes", params)
                         }
-                        else -> throw IllegalArgumentException("scope must be class|code|method_name")
+                        else -> throw IllegalArgumentException("scope must be class|string|code|method_name|field|comment")
                     }
+                }
+            ),
+            ToolDef(
+                name = "rename",
+                description = "Rename class/method/field alias. Persisted next to the APK cache and re-applied on next apk_load of the same file.",
+                properties = mapOf(
+                    apkIdP,
+                    "target_type" to ("string" to "class | method | field"),
+                    "class_name" to ("string" to "FQCN"),
+                    "name" to ("string" to "Current method/field name; ignored for class"),
+                    "new_name" to ("string" to "New alias")
+                ),
+                required = listOf("apk_id", "target_type", "class_name", "new_name"),
+                handler = { args ->
+                    val params = mutableMapOf(
+                        "target_type" to requireArg(args, "target_type"),
+                        "class_name" to requireArg(args, "class_name"),
+                        "new_name" to requireArg(args, "new_name")
+                    )
+                    argString(args, "name")?.let { params["name"] = it }
+                    workerGet(requireArg(args, "apk_id"), "/rename", params)
                 }
             )
         )
@@ -312,7 +369,7 @@ class JadxMcpServer(
     /** 构建已注册 tools 的 MCP Server 实例（每次会话可新建） */
     fun createServer(): Server {
         val server = Server(
-            serverInfo = Implementation(name = "jadx-core-mcp", version = "1.2.0"),
+            serverInfo = Implementation(name = "jadx-core-mcp", version = "1.4.0"),
             options = ServerOptions(capabilities = ServerCapabilities(tools = ServerCapabilities.Tools()))
         )
         for (def in buildTools()) {

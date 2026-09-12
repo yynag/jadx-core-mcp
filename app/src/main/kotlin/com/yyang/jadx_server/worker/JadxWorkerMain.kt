@@ -13,6 +13,7 @@ fun main(args: Array<String>) {
     var port = 0
     var masterPid: Long = -1
     var apkId = System.getenv("JADX_APK_ID") ?: "worker"
+    var deobf = true
 
     var i = 0
     while (i < args.size) {
@@ -21,6 +22,7 @@ fun main(args: Array<String>) {
             "--port" -> if (i + 1 < args.size) { port = args[++i].toIntOrNull() ?: 0 }
             "--master-pid" -> if (i + 1 < args.size) { masterPid = args[++i].toLongOrNull() ?: -1 }
             "--apk-id" -> if (i + 1 < args.size) { apkId = args[++i] }
+            "--deobf" -> if (i + 1 < args.size) { deobf = args[++i].toBooleanStrictOrNull() ?: true }
             "--bind" -> if (i + 1 < args.size) { i++ } // 忽略历史参数
         }
         i++
@@ -48,7 +50,7 @@ fun main(args: Array<String>) {
 
     try {
         val server = JadxHttpServer(port = port, cacheInstanceKey = apkId)
-        server.engine.loadApk(apkPath)
+        server.engine.loadApk(apkPath, deobfuscationOn = deobf)
         server.start()
         Thread.currentThread().join()
     } catch (e: Exception) {

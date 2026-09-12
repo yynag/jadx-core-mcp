@@ -63,15 +63,16 @@ java -jar app/build/libs/app-all.jar --port 8650
 
 | Tool | 作用 |
 |------|------|
-| `apk_load` / `apk_unload` / `apk_list` | 生命周期（`max_heap` 可选） |
-| `meta_summary` / `meta_manifest` | 摘要 / Manifest |
-| `meta_class` | 类列表或 methods+fields |
-| `decompile` | `target=java\|smali\|method\|main_activity`，`timeout` 由 Agent 决定 |
-| `resource` | `action=list\|file\|strings` |
-| `xref` | `target_type=class\|method\|field` |
-| `search` | `scope=class\|code\|method_name`；`timeout`/`max_scan`/`max_decompile` 由 Agent 决定 |
+| `apk_load` / `apk_unload` / `apk_list` | 生命周期（`max_heap`、`deobf` 可选，deobf **默认 true** 对齐 GUI 唯一化符号） |
+| `meta_summary` / `meta_manifest` | 摘要（mainPackage、topPackages）/ Manifest 组件 |
+| `meta_class` | 类列表（`package` / `main_app`）或 methods+fields **带签名** |
+| `decompile` | `target=java\|smali\|method\|main_activity`；超 80k 字符截断 |
+| `resource` | `action=list\|file\|strings\|id` |
+| `xref` | `target_type=class\|method\|field`，snippet + 小方法 `method_code` |
+| `search` | `scope=class\|string\|method_name\|field\|code\|comment`；命中带 `preview` |
+| `rename` | class/method/field 别名（按 APK 指纹落盘，下次 load 恢复） |
 
-失败：`isError=true`，不返回假源码。
+失败：`isError=true`，不返回假源码。类名接受 `p000.` / `defpackage.` 别名。
 
 ## REST 摘要
 
@@ -83,7 +84,7 @@ java -jar app/build/libs/app-all.jar --port 8650
 | `GET /apk/list` | 实例列表 |
 | `/meta/*` `/decompile/*` `/resource/*` `/xref/*` `/search/*` | 需 `apk_id` |
 
-搜索默认 `search_in=class`；`code` 需显式指定；非法 scope → 400。
+搜索默认 `search_in=class`（全量类名）；找文案/URL 用 `string`（DEX 常量）；`code`/`comment` 需显式指定且受预算。Agent 工作流见 `AGENTS.md`。
 
 ## 部署级环境变量（可选）
 

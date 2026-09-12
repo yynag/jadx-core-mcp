@@ -15,10 +15,10 @@ import java.util.concurrent.ConcurrentHashMap
  * EVIDENCE: 审查 K1/K2/L6；进程隔离卸载靠杀 JVM，磁盘缓存仍需按实例隔离。
  */
 class JadxCacheManager(
-    targetFile: File,
+    private val targetFile: File,
     /** Worker 实例隔离键（通常为 apk_id），避免同路径多开互写 */
     instanceKey: String,
-    jadxVersion: String = "1.5.6"
+    private val jadxVersion: String = "1.5.6"
 ) {
     val cacheDir: File
 
@@ -120,6 +120,58 @@ class JadxCacheManager(
     fun saveCachedSmali(className: String, smali: String) {
         memorySmaliCache[className] = SoftReference(smali)
         atomicWrite(getSmaliFile(className), smali)
+    }
+
+    /**
+     * DEX 字符串索引按 APK 指纹共享（不跟 apk_id），重启 Worker 可复用。
+     * deobf 会改 class/method 别名，必须分文件。
+     */
+    fun stringIndexFile(deobf: Boolean): File {
+        val parent = targetFile.parentFile ?: File(".")
+        val fingerprint = fileFingerprint(targetFile)
+        return File(
+            parent,
+            "${targetFile.name}_jadx_cache${File.separator}jadx-$jadxVersion${File.separator}_strings${File.separator}$fingerprint${File.separator}index-v2-deobf-$deobf.json"
+        )
+    }
+
+    fun loadStringIndexJson(deobf: Boolean): String? {
+        val f = stringIndexFile(deobf)
+        return if (f.exists()) f.readText(Charsets.UTF_8) else null
+    }
+
+    fun saveStringIndexJson(deobf: Boolean, json: String) {
+        atomicWrite(stringIndexFile(deobf), json)
+    }
+
+    fun userRenamesFile(deobf: Boolean): File {
+        val parent = targetFile.parentFile ?: File(".")
+        val fingerprint = fileFingerprint(targetFile)
+        return File(
+            parent,
+            "${targetFile.name}_jadx_cache${File.separator}jadx-$jadxVersion${File.separator}_renames${File.separator}$fingerprint${File.separator}user-renames-deobf-$deobf.json"
+        )
+    }
+
+    fun loadUserRenamesJson(deobf: Boolean): String? {
+        val f = userRenamesFile(deobf)
+        return if (f.exists()) f.readText(Charsets.UTF_8) else null
+    }
+
+    fun saveUserRenamesJson(deobf: Boolean, json: String) {
+        atomicWrite(userRenamesFile(deobf), json)
+    }
+
+    fun evict(className: String) {
+        memorySourceCache.remove(className)
+        memorySmaliCache.remove(className)
+        try {
+            val src = getSourceFile(className)
+            if (src.exists()) src.delete()
+            val smali = getSmaliFile(className)
+            if (smali.exists()) smali.delete()
+        } catch (_: Exception) {
+        }
     }
 
     fun clearCache() {

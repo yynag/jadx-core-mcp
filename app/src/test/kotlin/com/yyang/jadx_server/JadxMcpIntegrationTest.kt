@@ -75,7 +75,7 @@ class JadxMcpIntegrationTest {
             pm.sendWorkerRequest(
                 apkId,
                 "/search/classes",
-                mapOf("search_term" to "x", "search_in" to "comment")
+                mapOf("search_term" to "x", "search_in" to "bogus")
             )
         } catch (e: IllegalStateException) {
             threw = true

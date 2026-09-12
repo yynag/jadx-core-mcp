@@ -1,9 +1,16 @@
 package com.yyang.jadx_server.service
 
+import com.google.gson.Gson
 import com.yyang.jadx_server.cache.JadxCacheManager
 import jadx.api.JadxArgs
 import jadx.api.JadxDecompiler
 import jadx.api.JavaClass
+import jadx.api.JavaField
+import jadx.api.JavaMethod
+import jadx.api.JavaNode
+import jadx.api.plugins.input.insns.InsnIndexType
+import jadx.core.dex.nodes.MethodNode
+import jadx.core.utils.android.AndroidResourcesMap
 import org.w3c.dom.Element
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
@@ -51,14 +58,29 @@ class JadxEngine(
 
     private var decompiler: JadxDecompiler? = null
     private val classCache = ConcurrentHashMap<String, JavaClass>()
+    /** orig / 无包名 / p000↔defpackage 别名 → 同一 JavaClass；不用于列表，避免重复 */
+    private val classAliasIndex = ConcurrentHashMap<String, JavaClass>()
 
     // WHY: 只缓存资源「名字列表」，内容按需 loadContent，避免大包一次灌满堆（R1）
     @Volatile private var resourceNameIndex: List<String>? = null
+
+    /** DEX const-string 索引；首次 scope=string 时构建，完整后写入磁盘 */
+    @Volatile private var dexStringIndex: List<Map<String, String>>? = null
+    private val gson = Gson()
+
+    companion object {
+        const val MAX_AGENT_CODE_CHARS = 80_000
+        private const val PREVIEW_CHARS = 200
+    }
 
     var currentApkPath: String? = null
         private set
 
     var classesCount: Int = 0
+        private set
+
+    /** load 时是否打开 JADX deobf（短名 → p000 / mo1360kO，对齐 GUI） */
+    var deobfuscationOn: Boolean = true
         private set
 
     var cacheManager: JadxCacheManager? = null
@@ -72,12 +94,13 @@ class JadxEngine(
         ?: System.getenv("JADX_DECOMPILE_TIMEOUT")?.toLongOrNull()
         ?: 20L
 
-    // WHY: 默认预算写死；单次由请求 max_scan/max_decompile/timeout 覆盖（Agent 决定）
+    // WHY: code/comment 才需要预算；class/method/field 只扫名字，6 万类也是毫秒级
+    // DECISION: 元数据搜索默认全量；code 默认 max_scan=500 / max_decompile=50，请求可覆盖
     private val defaultMaxScan = 500
     private val defaultMaxDecompileOnSearch = 50
     private val searchTimeoutCapSec = 600L
 
-    fun loadApk(apkPath: String) {
+    fun loadApk(apkPath: String, deobfuscationOn: Boolean = true) {
         rwLock.write {
             // 无论上次是否成功，先清干净半初始化状态（L2）
             unloadApkInternal(clearCache = false)
@@ -93,7 +116,14 @@ class JadxEngine(
                 args.inputFiles = inputFiles
                 args.isSkipResources = false
                 args.isShowInconsistentCode = true
-                args.isDeobfuscationOn = false
+                // WHY: GUI 默认 deobf + minLength=3，才会把 kO/a 变成 mo1360kO/f230385a，空包变成 p000
+                // DECISION: 默认开，长度阈值对齐 jadx-gui JadxSettings；apk_load.deobf=false 可关
+                args.isDeobfuscationOn = deobfuscationOn
+                this.deobfuscationOn = deobfuscationOn
+                if (deobfuscationOn) {
+                    args.deobfuscationMinLength = 3
+                    args.deobfuscationMaxLength = 64
+                }
                 // 限制 jadx 内部并行，与自建池叠加防线程风暴
                 args.threadsCount = poolSize
                 args.pluginOptions = mapOf("dex-input.verify-checksum" to "no")
@@ -110,13 +140,14 @@ class JadxEngine(
 
                 classCache.clear()
                 for (javaClass in loadedClasses) {
-                    classCache[javaClass.fullName] = javaClass
+                    indexClass(javaClass)
                 }
 
                 this.decompiler = newDecompiler
                 this.cacheManager = cm
                 this.currentApkPath = apkPath
                 resourceNameIndex = null
+                applyPersistedRenamesLocked()
                 log.info("Initialization completed in {}ms. Loaded {} classes.", System.currentTimeMillis() - startTime, classesCount)
             } catch (e: Exception) {
                 try {
@@ -190,8 +221,11 @@ class JadxEngine(
 
     private fun unloadApkInternal(clearCache: Boolean) {
         classCache.clear()
+        classAliasIndex.clear()
         resourceNameIndex = null
+        dexStringIndex = null
         classesCount = 0
+        deobfuscationOn = true
         inflightSource.clear()
         inflightSmali.clear()
 
@@ -218,6 +252,40 @@ class JadxEngine(
 
     private fun effectiveTimeout(timeoutSeconds: Long?): Long {
         return (timeoutSeconds?.takeIf { it > 0 }) ?: defaultTimeoutSeconds
+    }
+
+    fun clipForAgent(code: String, maxChars: Int = MAX_AGENT_CODE_CHARS): Map<String, Any> {
+        if (code.length <= maxChars) {
+            return mapOf("code" to code, "truncated" to false, "total_chars" to code.length)
+        }
+        return mapOf(
+            "code" to code.substring(0, maxChars),
+            "truncated" to true,
+            "total_chars" to code.length,
+            "hint" to "Truncated at $maxChars chars. Prefer decompile target=method, or request a smaller class."
+        )
+    }
+
+    fun packageOverview(limit: Int = 20): Map<String, Any> {
+        val names = rwLock.read {
+            checkEngineReady()
+            classCache.keys().toList()
+        }
+        val counts = HashMap<String, Int>()
+        for (name in names) {
+            val pkg = name.substringBeforeLast('.', "")
+            val bucket = when {
+                pkg.isEmpty() -> "(default)"
+                pkg == "p000" || pkg.startsWith("p000.") -> "p000"
+                pkg == "defpackage" -> "defpackage"
+                else -> pkg.split('.').take(2).joinToString(".")
+            }
+            counts[bucket] = (counts[bucket] ?: 0) + 1
+        }
+        val topPackages = counts.entries.sortedByDescending { it.value }.take(limit).map {
+            mapOf("package" to it.key, "classes" to it.value)
+        }
+        return mapOf("topPackages" to topPackages)
     }
 
     /**
@@ -311,14 +379,24 @@ class JadxEngine(
      * DECISION: 先 getClassSource(timeout)，再 brace 切片；找不到方法抛 NOT_FOUND，禁止退回整类。
      */
     fun getMethodSourceCode(javaClass: JavaClass, methodName: String, timeoutSeconds: Long? = null): String {
+        val resolved = resolveMethod(javaClass, methodName)
         val fullSource = getClassSource(javaClass, timeoutSeconds)
-        val snippet = extractMethodSnippetFromClassSource(fullSource, methodName)
+        val names = listOfNotNull(resolved?.name, methodName).distinct()
+        val snippet = names.firstNotNullOfOrNull { extractMethodSnippetFromClassSource(fullSource, it) }
             ?: throw DecompileException(
                 DecompileException.NOT_FOUND,
                 "Method '$methodName' not found in decompiled source of ${javaClass.fullName}",
                 404
             )
         return snippet
+    }
+
+    private fun resolveMethod(javaClass: JavaClass, methodName: String): JavaMethod? {
+        val exact = javaClass.methods.filter { it.name == methodName }
+        if (exact.size == 1) return exact[0]
+        if (exact.isNotEmpty()) return exact[0]
+        val ended = javaClass.methods.filter { it.name.endsWith(methodName) && it.name != methodName }
+        return ended.singleOrNull()
     }
 
     private fun extractMethodSnippetFromClassSource(source: String, methodName: String): String? {
@@ -343,13 +421,70 @@ class JadxEngine(
         return result.joinToString("\n")
     }
 
-    fun getClassByName(className: String): JavaClass? {
-        return rwLock.read {
-            classCache[className]
-                ?: decompiler?.searchJavaClassByOrigFullName(className)
-                ?: decompiler?.searchJavaClassByAliasFullName(className)
+    private fun indexClass(javaClass: JavaClass) {
+        classCache[javaClass.fullName] = javaClass
+        fun alias(key: String) {
+            if (key.isNotBlank()) classAliasIndex.putIfAbsent(key, javaClass)
+        }
+        val raw = javaClass.rawName
+        val pkg = javaClass.getPackage()
+        alias(raw)
+        if (pkg.isNotBlank() && raw.isNotBlank() && !raw.contains('.')) alias("$pkg.$raw")
+        when {
+            javaClass.fullName.startsWith("p000.") -> alias("defpackage." + javaClass.fullName.removePrefix("p000."))
+            javaClass.fullName.startsWith("defpackage.") -> alias("p000." + javaClass.fullName.removePrefix("defpackage."))
         }
     }
+
+    fun getClassByName(className: String): JavaClass? {
+        val raw = className.trim()
+        if (raw.isEmpty()) return null
+        val candidates = linkedSetOf(raw)
+        when {
+            raw.startsWith("p000.") -> {
+                candidates += raw.removePrefix("p000.")
+                candidates += "defpackage." + raw.removePrefix("p000.")
+            }
+            raw.startsWith("defpackage.") -> {
+                candidates += raw.removePrefix("defpackage.")
+                candidates += "p000." + raw.removePrefix("defpackage.")
+            }
+            !raw.contains('.') -> {
+                candidates += "p000.$raw"
+                candidates += "defpackage.$raw"
+            }
+        }
+        return rwLock.read {
+            for (c in candidates) {
+                classCache[c]?.let { return@read it }
+                classAliasIndex[c]?.let { return@read it }
+                decompiler?.searchJavaClassByOrigFullName(c)?.let { return@read it }
+                decompiler?.searchJavaClassByAliasFullName(c)?.let { return@read it }
+            }
+            val simple = raw.substringAfterLast('.')
+            val hits = classCache.values.filter { it.name == simple || it.rawName == simple }.distinct()
+            if (hits.size == 1) hits[0] else null
+        }
+    }
+
+    fun methodEntries(javaClass: JavaClass): List<Map<String, String>> =
+        javaClass.methods.map { m ->
+            mapOf(
+                "name" to m.name,
+                "full_name" to m.fullName,
+                "access" to m.accessFlags.toString()
+            )
+        }
+
+    fun fieldEntries(javaClass: JavaClass): List<Map<String, String>> =
+        javaClass.fields.map { f ->
+            mapOf(
+                "name" to f.name,
+                "full_name" to f.fullName,
+                "type" to f.type.toString(),
+                "access" to f.accessFlags.toString()
+            )
+        }
 
     fun getAllClassNames(offset: Int, count: Int): List<String> {
         return rwLock.read {
@@ -409,8 +544,8 @@ class JadxEngine(
             var fallbackManifest = ""
             for (res in decompiler!!.resources) {
                 if (res.originalName == "AndroidManifest.xml" || res.deobfName == "AndroidManifest.xml") {
-                    val container = res.loadContent()
-                    if (container != null && container.text != null) {
+                    val container = safeLoadContent(res) ?: continue
+                    if (container.text != null) {
                         val xml = container.text.codeStr
                         if (fallbackManifest.isEmpty()) fallbackManifest = xml
                         if (!xml.contains("split=\"")) return@read xml
@@ -447,7 +582,7 @@ class JadxEngine(
             for (res in decompiler!!.resources) {
                 val n = res.deobfName ?: res.originalName ?: continue
                 if (n == name || n.endsWith("/$name")) {
-                    val container = res.loadContent() ?: continue
+                    val container = safeLoadContent(res) ?: continue
                     if (container.text != null) {
                         return@read container.text.codeStr
                     }
@@ -459,7 +594,7 @@ class JadxEngine(
                 }
                 // 递归子容器仅在匹配前缀时展开
                 if (name.contains("/") && (name.startsWith(n) || n.contains(name.substringBeforeLast('/')))) {
-                    val container = res.loadContent()
+                    val container = safeLoadContent(res)
                     if (container != null) {
                         val found = findInContainer(container, name)
                         if (found != null) return@read found
@@ -468,7 +603,7 @@ class JadxEngine(
             }
             // 兜底：尝试 load 全部 resources 的顶层匹配（仍不做全树常驻）
             for (res in decompiler!!.resources) {
-                val container = res.loadContent() ?: continue
+                val container = safeLoadContent(res) ?: continue
                 val found = findInContainer(container, name)
                 if (found != null) return@read found
             }
@@ -476,25 +611,39 @@ class JadxEngine(
         }
     }
 
-    private fun findInContainer(container: jadx.core.xmlgen.ResContainer, name: String): String? {
-        val resName = container.fileName ?: container.name
-        if (resName == name || resName?.endsWith("/$name") == true || container.name == name) {
-            if (container.text != null) return container.text.codeStr
+    private fun safeLoadContent(res: jadx.api.ResourceFile): jadx.core.xmlgen.ResContainer? {
+        return try {
+            res.loadContent()
+        } catch (e: Exception) {
+            log.warn("loadContent failed for {}: {}", res.originalName ?: res.deobfName, e.message)
+            null
         }
-        val subs = container.subFiles
-        if (subs != null) {
+    }
+
+    private fun findInContainer(container: jadx.core.xmlgen.ResContainer, name: String): String? {
+        return try {
+            val resName = container.fileName ?: container.name
+            if (resName == name || resName?.endsWith("/$name") == true || container.name == name) {
+                if (container.text != null) return container.text.codeStr
+            }
+            val subs = container.subFiles ?: return null
             for (sub in subs) {
                 val found = findInContainer(sub, name)
                 if (found != null) return found
             }
+            null
+        } catch (e: Exception) {
+            log.warn("findInContainer skipped for {}: {}", name, e.message)
+            null
         }
-        return null
     }
 
     fun getAllResourceFileNames(offset: Int, count: Int): List<String> {
         val all = ensureResourceNameIndex()
         return pageList(all, offset, count)
     }
+
+    fun countResources(): Int = ensureResourceNameIndex().size
 
     fun getStrings(offset: Int, count: Int): List<Map<String, String>> {
         val stringsXml = try {
@@ -593,10 +742,92 @@ class JadxEngine(
         return null
     }
 
+    fun getManifestPackage(): String {
+        val xml = getManifest()
+        if (xml.isEmpty()) return ""
+        return try {
+            val factory = secureXmlFactory(namespaceAware = true)
+            val document = factory.newDocumentBuilder().parse(ByteArrayInputStream(xml.toByteArray(Charsets.UTF_8)))
+            (document.getElementsByTagName("manifest").item(0) as? Element)?.getAttribute("package") ?: ""
+        } catch (e: Exception) {
+            log.warn("Failed to parse manifest package: {}", e.message)
+            ""
+        }
+    }
+
+    /**
+     * 列出 Manifest 组件，对齐 GUI get_manifest_component。
+     * componentType: activity|service|receiver|provider（activity 含 activity-alias）
+     */
+    fun getManifestComponents(componentType: String, onlyExported: Boolean = false): Map<String, Any> {
+        val type = componentType.trim().lowercase()
+        val allowed = mapOf(
+            "activity" to listOf("activity", "activity-alias"),
+            "service" to listOf("service"),
+            "receiver" to listOf("receiver"),
+            "provider" to listOf("provider")
+        )
+        val tags = allowed[type]
+            ?: throw DecompileException(
+                DecompileException.INVALID_ARGUMENT,
+                "component_type must be activity|service|receiver|provider",
+                400
+            )
+        val xml = getManifest()
+        if (xml.isEmpty()) {
+            return mapOf("component_type" to type, "only_exported" to onlyExported, "count" to 0, "components" to emptyList<Map<String, String>>())
+        }
+        val pkg = getManifestPackage()
+        val components = mutableListOf<Map<String, String>>()
+        try {
+            val factory = secureXmlFactory(namespaceAware = true)
+            val document = factory.newDocumentBuilder().parse(ByteArrayInputStream(xml.toByteArray(Charsets.UTF_8)))
+            for (tag in tags) {
+                val nodes = document.getElementsByTagName(tag)
+                for (i in 0 until nodes.length) {
+                    val node = nodes.item(i) as Element
+                    val rawName = if (tag == "activity-alias") androidAttr(node, "targetActivity").ifBlank { androidAttr(node, "name") } else androidAttr(node, "name")
+                    val name = qualifyComponentName(rawName, pkg)
+                    val exportedAttr = androidAttr(node, "exported")
+                    val hasFilter = node.getElementsByTagName("intent-filter").length > 0
+                    val exported = when (exportedAttr.lowercase()) {
+                        "true" -> true
+                        "false" -> false
+                        else -> hasFilter
+                    }
+                    if (onlyExported && !exported) continue
+                    components.add(
+                        mapOf(
+                            "name" to name,
+                            "tag" to tag,
+                            "exported" to exported.toString(),
+                            "enabled" to androidAttr(node, "enabled").ifBlank { "true" }
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            log.warn("Failed to parse manifest components: {}", e.message)
+        }
+        return mapOf(
+            "component_type" to type,
+            "only_exported" to onlyExported,
+            "count" to components.size,
+            "components" to components
+        )
+    }
+
+    private fun qualifyComponentName(name: String, pkg: String): String {
+        if (name.isBlank()) return name
+        if (name.startsWith(".")) return pkg + name
+        if (!name.contains(".")) return if (pkg.isBlank()) name else "$pkg.$name"
+        return name
+    }
+
     /**
      * 搜索类。
-     * WHY: search_in=code 默认全包反编译是性能炸弹；method/field/comment 从未实现却写在文档里。
-     * DECISION: 仅 class|code；默认由 HTTP 层给 class；code 模式硬限额 + 请求 timeout 上限。
+     * WHY: search_in=code 默认全包反编译是性能炸弹。
+     * DECISION: class/method/field 全量扫名字；code/comment 硬限额 + 请求 timeout。
      * 返回不含全文 code，避免撑爆 Agent 上下文。
      */
     fun searchClassesByKeyword(
@@ -615,20 +846,28 @@ class JadxEngine(
             throw DecompileException(DecompileException.INVALID_ARGUMENT, "search_term must not be empty", 400)
         }
         val scopes = searchIn.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
-        val allowed = setOf("class", "code")
+            .map { if (it == "method_name") "method" else it }
+        val allowed = setOf("class", "code", "method", "field", "comment", "string")
         val unknown = scopes.filter { it !in allowed }
         if (unknown.isNotEmpty()) {
             throw DecompileException(
                 DecompileException.INVALID_ARGUMENT,
-                "Unsupported search_in value(s): ${unknown.joinToString(",")}. Allowed: class, code",
+                "Unsupported search_in value(s): ${unknown.joinToString(",")}. Allowed: class, code, method, field, comment, string",
                 400
             )
         }
         if (scopes.isEmpty()) {
-            throw DecompileException(DecompileException.INVALID_ARGUMENT, "search_in must include class and/or code", 400)
+            throw DecompileException(DecompileException.INVALID_ARGUMENT, "search_in must include class, code, method, field, comment and/or string", 400)
+        }
+        if (scopes.contains("string") && scopes.size == 1) {
+            return searchDexStrings(term, pkg, offset, count, timeoutSeconds, maxScan)
         }
         val searchCode = scopes.contains("code")
+        val searchComment = scopes.contains("comment")
         val searchClass = scopes.contains("class")
+        val searchMethod = scopes.contains("method")
+        val searchField = scopes.contains("field")
+        val needsDecompile = searchCode || searchComment
         val budgetSec = min(effectiveTimeout(timeoutSeconds), searchTimeoutCapSec)
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(budgetSec)
 
@@ -648,7 +887,7 @@ class JadxEngine(
         var budgetHit = false
 
         for (javaClass in targetClasses) {
-            if (scanned >= maxScanClasses) {
+            if (needsDecompile && scanned >= maxScanClasses) {
                 budgetHit = true
                 break
             }
@@ -660,11 +899,29 @@ class JadxEngine(
 
             var matched = false
             var matchType = ""
-            if (searchClass && javaClass.fullName.contains(term, ignoreCase = true)) {
+            var preview = ""
+            if (searchClass && (javaClass.fullName.contains(term, ignoreCase = true) || javaClass.rawName.contains(term, ignoreCase = true))) {
                 matched = true
                 matchType = "class"
+                preview = javaClass.fullName
             }
-            if (!matched && searchCode) {
+            if (!matched && searchMethod) {
+                val m = javaClass.methods.firstOrNull { it.name.contains(term, ignoreCase = true) }
+                if (m != null) {
+                    matched = true
+                    matchType = "method"
+                    preview = m.fullName
+                }
+            }
+            if (!matched && searchField) {
+                val f = javaClass.fields.firstOrNull { it.name.contains(term, ignoreCase = true) }
+                if (f != null) {
+                    matched = true
+                    matchType = "field"
+                    preview = f.fullName
+                }
+            }
+            if (!matched && needsDecompile) {
                 if (decompiled >= maxDecompileOnSearch) {
                     budgetHit = true
                     break
@@ -673,9 +930,14 @@ class JadxEngine(
                     val remainingSec = max(1L, TimeUnit.NANOSECONDS.toSeconds(deadline - System.nanoTime()))
                     val source = getClassSource(javaClass, remainingSec)
                     decompiled++
-                    if (source.contains(term, ignoreCase = true)) {
+                    if (searchCode && source.contains(term, ignoreCase = true)) {
                         matched = true
                         matchType = "code"
+                        preview = source.lines().firstOrNull { it.contains(term, ignoreCase = true) }?.trim().orEmpty()
+                    } else if (searchComment && source.lines().any { isCommentLine(it) && it.contains(term, ignoreCase = true) }) {
+                        matched = true
+                        matchType = "comment"
+                        preview = source.lines().firstOrNull { isCommentLine(it) && it.contains(term, ignoreCase = true) }?.trim().orEmpty()
                     }
                 } catch (_: DecompileException) {
                     // 单类超时/失败跳过，不中断整次搜索
@@ -683,7 +945,13 @@ class JadxEngine(
                 }
             }
             if (matched) {
-                results.add(mapOf("class_name" to javaClass.fullName, "match_type" to matchType))
+                results.add(
+                    mapOf(
+                        "class_name" to javaClass.fullName,
+                        "match_type" to matchType,
+                        "preview" to preview.take(PREVIEW_CHARS)
+                    )
+                )
             }
         }
 
@@ -702,7 +970,13 @@ class JadxEngine(
         )
     }
 
-    fun searchMethodByName(methodName: String, offset: Int = 0, count: Int = 50): List<Map<String, String>> {
+    fun searchMethodByName(
+        methodName: String,
+        offset: Int = 0,
+        count: Int = 50,
+        pkg: String = "",
+        maxScan: Int? = null
+    ): Map<String, Any> {
         if (methodName.isBlank()) {
             throw DecompileException(DecompileException.INVALID_ARGUMENT, "method_name must not be empty", 400)
         }
@@ -710,80 +984,465 @@ class JadxEngine(
             checkEngineReady()
             val results = mutableListOf<Map<String, String>>()
             var scanned = 0
-            for (javaClass in classCache.values) {
-                if (scanned >= defaultMaxScan) break
+            val cap = maxScan?.takeIf { it > 0 } ?: Int.MAX_VALUE
+            val classes = if (pkg.isNotEmpty()) {
+                val prefix = if (pkg.endsWith(".")) pkg else "$pkg."
+                classCache.values.filter { it.fullName == pkg || it.fullName.startsWith(prefix) }
+            } else {
+                classCache.values
+            }
+            for (javaClass in classes) {
+                if (scanned >= cap) break
                 scanned++
                 for (method in javaClass.methods) {
                     if (method.name.contains(methodName, ignoreCase = true)) {
                         results.add(
                             mapOf(
                                 "class_name" to javaClass.fullName,
-                                "method" to method.name
+                                "method" to method.name,
+                                "preview" to method.fullName.take(PREVIEW_CHARS)
                             )
                         )
                     }
                 }
             }
-            pageList(results, offset, count)
+            mapOf(
+                "matches" to pageList(results, offset, count),
+                "matched_total" to results.size,
+                "scanned" to scanned,
+                "budget_hit" to (scanned >= cap && cap != Int.MAX_VALUE)
+            )
+        }
+    }
+
+    fun searchFieldByName(
+        fieldName: String,
+        offset: Int = 0,
+        count: Int = 50,
+        pkg: String = ""
+    ): Map<String, Any> {
+        if (fieldName.isBlank()) {
+            throw DecompileException(DecompileException.INVALID_ARGUMENT, "search_term must not be empty", 400)
+        }
+        return rwLock.read {
+            checkEngineReady()
+            val results = mutableListOf<Map<String, String>>()
+            val classes = if (pkg.isNotEmpty()) {
+                val prefix = if (pkg.endsWith(".")) pkg else "$pkg."
+                classCache.values.filter { it.fullName == pkg || it.fullName.startsWith(prefix) }
+            } else {
+                classCache.values
+            }
+            for (javaClass in classes) {
+                for (field in javaClass.fields) {
+                    if (field.name.contains(fieldName, ignoreCase = true)) {
+                        results.add(
+                            mapOf(
+                                "class_name" to javaClass.fullName,
+                                "field" to field.name,
+                                "preview" to field.fullName.take(PREVIEW_CHARS)
+                            )
+                        )
+                    }
+                }
+            }
+            mapOf("matches" to pageList(results, offset, count), "matched_total" to results.size)
         }
     }
 
     fun getXrefsToClass(className: String, offset: Int, count: Int, timeoutSeconds: Long? = null): List<Map<String, String>> {
         val javaClass = requireClass(className)
-        val simpleName = javaClass.name
         val usage = rwLock.read { javaClass.useIn }
         val page = pageList(usage, offset, min(count, 50).coerceAtLeast(1))
-        return page.map { node ->
-            val parentClass = node.topParentClass
-            val snippet = extractSnippetFromParent(parentClass, timeoutSeconds, simpleName, className)
-            mapOf("class_name" to parentClass.fullName, "code_snippet" to snippet)
-        }
+        return page.map { usageEntry(it, timeoutSeconds, javaClass.name, javaClass.fullName, javaClass.rawName) }
     }
 
     fun getXrefsToMethod(className: String, methodName: String, offset: Int, count: Int, timeoutSeconds: Long? = null): List<Map<String, String>> {
         val javaClass = requireClass(className)
         val targetMethod = rwLock.read {
-            javaClass.methods.find { it.name == methodName }
+            resolveMethod(javaClass, methodName)
                 ?: throw DecompileException(DecompileException.NOT_FOUND, "Method '$methodName' not found in class '$className'", 404)
         }
-        val usage = rwLock.read { targetMethod.useIn }
-        val page = pageList(usage, offset, min(count, 50).coerceAtLeast(1))
-        return page.map { node ->
-            val parentClass = node.topParentClass
-            val snippet = extractSnippetFromParent(parentClass, timeoutSeconds, methodName, targetMethod.name)
-            mapOf("class_name" to parentClass.fullName, "code_snippet" to snippet)
+        val callers = rwLock.read { collectMethodCallers(targetMethod) }
+        val page = pageList(callers, offset, min(count, 50).coerceAtLeast(1))
+        return page.map { mth ->
+            val row = mutableMapOf(
+                "class_name" to mth.declaringClass.fullName,
+                "method" to mth.alias
+            )
+            try {
+                val parent = getClassByName(mth.declaringClass.fullName)
+                if (parent != null) {
+                    val snippet = extractSnippetFromParent(parent, timeoutSeconds, mth.alias, methodName, targetMethod.name)
+                    if (snippet.isNotEmpty()) row["code_snippet"] = snippet
+                }
+            } catch (_: Exception) {
+            }
+            row
         }
+    }
+
+    private fun collectMethodCallers(target: JavaMethod): List<MethodNode> {
+        val out = LinkedHashSet<MethodNode>()
+        val node = target.methodNode
+        out.addAll(node.useIn)
+        try {
+            for (rel in target.overrideRelatedMethods) {
+                out.addAll(rel.methodNode.useIn)
+            }
+        } catch (_: Exception) {
+        }
+        val origName = try {
+            node.methodInfo.name
+        } catch (_: Exception) {
+            node.name
+        }
+        try {
+            val root = decompiler?.root
+            node.declaringClass.visitSuperTypes { _, type ->
+                val superCls = root?.resolveClass(type) ?: return@visitSuperTypes
+                val related = superCls.searchMethodByShortName(origName) ?: superCls.searchMethodByShortName(node.alias)
+                if (related != null) out.addAll(related.useIn)
+            }
+        } catch (_: Exception) {
+        }
+        if (out.isEmpty()) {
+            val root = decompiler?.root
+            if (root != null) {
+                for (cls in root.classes) {
+                    for (mth in cls.methods) {
+                        try {
+                            if (mth.used.contains(node)) out.add(mth)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
+        }
+        out.remove(node)
+        return out.toList()
     }
 
     fun getXrefsToField(className: String, fieldName: String, offset: Int, count: Int, timeoutSeconds: Long? = null): List<Map<String, String>> {
         val javaClass = requireClass(className)
         val targetField = rwLock.read {
-            javaClass.fields.find { it.name == fieldName }
+            javaClass.fields.find { it.name == fieldName || it.rawName == fieldName }
                 ?: throw DecompileException(DecompileException.NOT_FOUND, "Field '$fieldName' not found in class '$className'", 404)
         }
         val usage = rwLock.read { targetField.useIn }
         val page = pageList(usage, offset, min(count, 50).coerceAtLeast(1))
-        return page.map { node ->
-            val parentClass = node.topParentClass
-            val snippet = extractSnippetFromParent(parentClass, timeoutSeconds, fieldName, targetField.name)
-            mapOf("class_name" to parentClass.fullName, "code_snippet" to snippet)
+        return page.map { usageEntry(it, timeoutSeconds, fieldName, targetField.name) }
+    }
+
+    private fun usageEntry(node: JavaNode, timeoutSeconds: Long?, vararg keywords: String): Map<String, String> {
+        val parentClass = node.topParentClass
+        val methodName = if (node is JavaMethod) node.name else ""
+        val fieldName = if (node is JavaField) node.name else ""
+        val snippet = extractSnippetFromParent(parentClass, timeoutSeconds, methodName, *keywords)
+        val out = mutableMapOf("class_name" to parentClass.fullName)
+        if (methodName.isNotEmpty()) out["method"] = methodName
+        if (fieldName.isNotEmpty()) out["field"] = fieldName
+        if (snippet.isNotEmpty()) out["code_snippet"] = snippet
+        if (node is JavaMethod) {
+            try {
+                val methodSrc = getMethodSourceCode(parentClass, node.name, min(timeoutSeconds ?: 5L, 8L))
+                if (methodSrc.length in 1..4000) out["method_code"] = methodSrc
+            } catch (_: Exception) {
+            }
+        }
+        return out
+    }
+
+    private fun extractSnippetFromParent(parentClass: JavaClass, timeoutSeconds: Long?, @Suppress("UNUSED_PARAMETER") enclosingMethod: String, vararg targetKeywords: String): String {
+        return try {
+            val perClass = min(timeoutSeconds ?: 5L, 5L)
+            val source = getClassSource(parentClass, perClass)
+            val lines = source.lines()
+            val ranked = targetKeywords.filter { it.isNotEmpty() }.sortedByDescending { it.length }
+            var fallback: String? = null
+            for ((idx, line) in lines.withIndex()) {
+                val trimmed = line.trim()
+                if (trimmed.startsWith("package ") || trimmed.startsWith("import ")) continue
+                for (kw in ranked) {
+                    if (!identifierHit(trimmed, kw)) continue
+                    if (isDeclarationLine(trimmed, kw)) {
+                        if (fallback == null) fallback = "Line ${idx + 1}: $trimmed"
+                        continue
+                    }
+                    return "Line ${idx + 1}: $trimmed"
+                }
+            }
+            fallback ?: "Referenced in ${parentClass.fullName}"
+        } catch (_: Exception) {
+            "Referenced in ${parentClass.fullName} (snippet unavailable)"
         }
     }
 
-    private fun extractSnippetFromParent(parentClass: JavaClass, timeoutSeconds: Long?, vararg targetKeywords: String): String {
-        return try {
-            val source = getClassSource(parentClass, timeoutSeconds ?: 5L)
-            val lines = source.lines()
-            for ((idx, line) in lines.withIndex()) {
-                for (kw in targetKeywords) {
-                    if (kw.isNotEmpty() && line.contains(kw)) {
-                        return "Line ${idx + 1}: ${line.trim()}"
+    private fun isDeclarationLine(line: String, kw: String): Boolean {
+        val t = line.trim()
+        if (t.startsWith("/*") || t.startsWith("*") || t.startsWith("//")) return true
+        return Regex("""(?:final|private|protected|public|static|volatile|transient|\s)+.+\s+\Q$kw\E\s*[;=]""").containsMatchIn(t)
+    }
+
+    private fun identifierHit(line: String, kw: String): Boolean {
+        if (kw.length >= 3) return line.contains(kw)
+        val regex = Regex("(?<![A-Za-z0-9_])${Regex.escape(kw)}(?![A-Za-z0-9_])")
+        return regex.containsMatchIn(line)
+    }
+
+    private fun isCommentLine(line: String): Boolean {
+        val t = line.trim()
+        return t.startsWith("//") || t.startsWith("/*") || t.startsWith("*") || t.startsWith("*/")
+    }
+
+    fun searchDexStrings(
+        term: String,
+        pkg: String = "",
+        offset: Int = 0,
+        count: Int = 50,
+        timeoutSeconds: Long? = null,
+        maxScan: Int? = null
+    ): Map<String, Any> {
+        if (term.isBlank()) {
+            throw DecompileException(DecompileException.INVALID_ARGUMENT, "search_term must not be empty", 400)
+        }
+        val budgetSec = min(effectiveTimeout(timeoutSeconds), searchTimeoutCapSec)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(budgetSec)
+        val maxScanClasses = (maxScan?.takeIf { it > 0 }) ?: Int.MAX_VALUE
+        val prefix = if (pkg.isNotEmpty() && !pkg.endsWith(".")) "$pkg." else pkg
+
+        fun persist(store: DexStringIndexStore) {
+            try {
+                cacheManager?.saveStringIndexJson(deobfuscationOn, gson.toJson(store))
+            } catch (e: Exception) {
+                log.warn("Failed to persist string index: {}", e.message)
+            }
+        }
+
+        val mem = dexStringIndex
+        val disk: DexStringIndexStore? = if (mem != null) {
+            DexStringIndexStore(complete = true, scanned = mem.size, total = mem.size, hits = mem)
+        } else {
+            try {
+                cacheManager?.loadStringIndexJson(deobfuscationOn)?.let {
+                    gson.fromJson(it, DexStringIndexStore::class.java)
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        val index: List<Map<String, String>>
+        var fromCache = false
+        var budgetHit = false
+        if (disk?.complete == true) {
+            dexStringIndex = disk.hits
+            index = disk.hits
+            fromCache = true
+        } else {
+            val root = rwLock.read {
+                checkEngineReady()
+                decompiler!!.root
+            }
+            val classes = root.classes
+            val built = ArrayList<Map<String, String>>(disk?.hits?.size ?: 4096)
+            if (disk != null) built.addAll(disk.hits)
+            var scanned = disk?.scanned ?: 0
+            if (scanned > classes.size) scanned = 0
+            val start = scanned
+            for (i in start until classes.size) {
+                if (System.nanoTime() > deadline || (i - start) >= maxScanClasses) {
+                    budgetHit = true
+                    break
+                }
+                scanned = i + 1
+                val cls = classes[i]
+                val clsName = cls.fullName
+                for (mth in cls.methods) {
+                    if (System.nanoTime() > deadline) {
+                        budgetHit = true
+                        break
+                    }
+                    if (mth.isNoCode) continue
+                    try {
+                        val reader = mth.codeReader ?: continue
+                        reader.visitInstructions { insn ->
+                            if (insn.indexType != InsnIndexType.STRING_REF) return@visitInstructions
+                            try {
+                                insn.decode()
+                                val value = insn.indexAsString ?: return@visitInstructions
+                                if (value.isEmpty()) return@visitInstructions
+                                built.add(
+                                    mapOf(
+                                        "class_name" to clsName,
+                                        "method" to mth.alias,
+                                        "preview" to value.take(PREVIEW_CHARS),
+                                        "match_type" to "string"
+                                    )
+                                )
+                            } catch (_: Exception) {
+                            }
+                        }
+                    } catch (_: Exception) {
                     }
                 }
             }
-            "Referenced in ${parentClass.fullName}"
+            val complete = scanned >= classes.size && !budgetHit
+            if (complete) {
+                dexStringIndex = built
+            }
+            persist(DexStringIndexStore(complete = complete, scanned = scanned, total = classes.size, hits = built))
+            index = built
+        }
+
+        val matched = index.filter { hit ->
+            val inPkg = prefix.isEmpty() || hit.getValue("class_name") == pkg || hit.getValue("class_name").startsWith(prefix)
+            inPkg && hit.getValue("preview").contains(term, ignoreCase = true)
+        }
+        return mapOf(
+            "classes" to pageList(matched, offset, count),
+            "matched_total" to matched.size,
+            "indexed" to index.size,
+            "from_cache" to fromCache,
+            "budget_hit" to (dexStringIndex == null),
+            "limits" to mapOf("timeout_sec" to budgetSec, "max_scan" to maxScanClasses)
+        )
+    }
+
+    fun lookupResourceId(idRaw: String): Map<String, Any> {
+        if (idRaw.isBlank()) {
+            throw DecompileException(DecompileException.INVALID_ARGUMENT, "Missing resource id", 400)
+        }
+        rwLock.read { checkEngineReady() }
+        val trimmed = idRaw.trim()
+        val id = when {
+            trimmed.startsWith("0x") || trimmed.startsWith("0X") -> trimmed.substring(2).toLongOrNull(16)?.toInt()
+            else -> trimmed.toLongOrNull()?.toInt() ?: trimmed.toLongOrNull(16)?.toInt()
+        } ?: throw DecompileException(DecompileException.INVALID_ARGUMENT, "Invalid resource id: $idRaw", 400)
+
+        val names = try {
+            decompiler!!.root.constValues.resourcesNames
         } catch (_: Exception) {
-            "Referenced in ${parentClass.fullName} (snippet unavailable)"
+            emptyMap<Int, String>()
+        }
+        val mapped = names[id] ?: AndroidResourcesMap.getResName(id) ?: ""
+        var stringValue = ""
+        if (mapped.isNotEmpty()) {
+            val shortName = mapped.substringAfterLast('/')
+            try {
+                val strings = getStrings(0, 5000)
+                val hit = strings.firstOrNull { it["name"] == shortName || it["name"] == mapped }
+                if (hit != null) stringValue = hit["value"].orEmpty()
+            } catch (_: Exception) {
+            }
+        }
+        return mapOf(
+            "id" to id,
+            "id_hex" to ("0x" + Integer.toHexString(id)),
+            "name" to mapped,
+            "value" to stringValue
+        )
+    }
+
+    fun renameSymbol(targetType: String, className: String, name: String, newName: String): Map<String, Any> {
+        if (newName.isBlank()) {
+            throw DecompileException(DecompileException.INVALID_ARGUMENT, "new_name must not be empty", 400)
+        }
+        val javaClass = requireClass(className)
+        val oldClassName = javaClass.fullName
+        when (targetType.lowercase()) {
+            "class" -> javaClass.classNode.rename(newName)
+            "method" -> {
+                val m = resolveMethod(javaClass, name)
+                    ?: throw DecompileException(DecompileException.NOT_FOUND, "Method '$name' not found in '$className'", 404)
+                m.methodNode.rename(newName)
+            }
+            "field" -> {
+                val f = javaClass.fields.find { it.name == name || it.rawName == name }
+                    ?: throw DecompileException(DecompileException.NOT_FOUND, "Field '$name' not found in '$className'", 404)
+                f.fieldNode.rename(newName)
+            }
+            else -> throw DecompileException(
+                DecompileException.INVALID_ARGUMENT,
+                "target_type must be class|method|field",
+                400
+            )
+        }
+        try {
+            javaClass.classNode.reloadCode()
+        } catch (_: Exception) {
+        }
+        try {
+            decompiler?.reloadCodeData()
+        } catch (_: Exception) {
+        }
+        rwLock.write {
+            cacheManager?.evict(oldClassName)
+            cacheManager?.evict(javaClass.fullName)
+            classCache.remove(oldClassName)
+            indexClass(javaClass)
+        }
+        persistUserRename(UserRenameOp(targetType.lowercase(), oldClassName, name, newName))
+        return mapOf(
+            "status" to "success",
+            "target_type" to targetType,
+            "class_name" to javaClass.fullName,
+            "old_class_name" to oldClassName,
+            "name" to name,
+            "new_name" to newName,
+            "persisted" to true
+        )
+    }
+
+    private fun applyPersistedRenamesLocked() {
+        val json = try {
+            cacheManager?.loadUserRenamesJson(deobfuscationOn)
+        } catch (_: Exception) {
+            null
+        } ?: return
+        val ops = try {
+            gson.fromJson(json, Array<UserRenameOp>::class.java)?.toList().orEmpty()
+        } catch (e: Exception) {
+            log.warn("Failed to parse persisted renames: {}", e.message)
+            return
+        }
+        for (op in ops) {
+            try {
+                applyRenameOpLocked(op)
+            } catch (e: Exception) {
+                log.warn("Failed to apply rename {} {} -> {}: {}", op.type, op.name, op.newName, e.message)
+            }
+        }
+        if (ops.isNotEmpty()) {
+            log.info("Applied {} persisted rename(s)", ops.size)
+        }
+    }
+
+    private fun applyRenameOpLocked(op: UserRenameOp) {
+        val javaClass = getClassByName(op.className) ?: return
+        val old = javaClass.fullName
+        when (op.type) {
+            "class" -> javaClass.classNode.rename(op.newName)
+            "method" -> resolveMethod(javaClass, op.name)?.methodNode?.rename(op.newName)
+            "field" -> javaClass.fields.find { it.name == op.name || it.rawName == op.name }?.fieldNode?.rename(op.newName)
+        }
+        try {
+            javaClass.classNode.reloadCode()
+        } catch (_: Exception) {
+        }
+        classCache.remove(old)
+        indexClass(javaClass)
+    }
+
+    private fun persistUserRename(op: UserRenameOp) {
+        try {
+            val existing = cacheManager?.loadUserRenamesJson(deobfuscationOn)?.let {
+                gson.fromJson(it, Array<UserRenameOp>::class.java)?.toMutableList()
+            } ?: mutableListOf()
+            existing.add(op)
+            cacheManager?.saveUserRenamesJson(deobfuscationOn, gson.toJson(existing))
+        } catch (e: Exception) {
+            log.warn("Failed to persist rename: {}", e.message)
         }
     }
 
@@ -799,3 +1458,17 @@ class JadxEngine(
         return list.subList(offset, toIndex)
     }
 }
+
+internal data class DexStringIndexStore(
+    val complete: Boolean = false,
+    val scanned: Int = 0,
+    val total: Int = 0,
+    val hits: List<Map<String, String>> = emptyList()
+)
+
+internal data class UserRenameOp(
+    val type: String = "",
+    val className: String = "",
+    val name: String = "",
+    val newName: String = ""
+)

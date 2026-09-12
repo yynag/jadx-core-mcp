@@ -58,10 +58,12 @@ class JadxHttpServer(
         }
         listOf(
             "/meta/manifest", "/meta/summary", "/meta/classes", "/meta/methods", "/meta/fields", "/meta/main-activity",
+            "/meta/components",
             "/decompile/java", "/decompile/smali", "/decompile/method",
-            "/resource/strings", "/resource/list", "/resource/file",
+            "/resource/strings", "/resource/list", "/resource/file", "/resource/id",
             "/xref/class", "/xref/method", "/xref/field",
-            "/search/classes", "/search/method"
+            "/search/classes", "/search/method", "/search/field", "/search/string",
+            "/rename"
         ).forEach { path -> server.createContext(path, businessHandler) }
 
         server.start()
@@ -85,51 +87,66 @@ class JadxHttpServer(
                 "/meta/manifest" -> ResponseUtils.sendSuccess(exchange, mapOf("content" to engine.getManifest()))
                 "/meta/summary" -> {
                     val activity = engine.getMainActivity()
+                    val overview = engine.packageOverview()
                     ResponseUtils.sendSuccess(
                         exchange,
                         mapOf(
                             "classesCount" to engine.classesCount,
                             "mainActivity" to (activity?.fullName ?: ""),
-                            "currentApkPath" to (engine.currentApkPath ?: "")
+                            "mainPackage" to engine.getManifestPackage(),
+                            "deobf" to engine.deobfuscationOn,
+                            "currentApkPath" to (engine.currentApkPath ?: ""),
+                            "topPackages" to overview["topPackages"],
+                            "decompileHint" to "Large classes: set timeout=90. Prefer decompile target=method."
                         )
                     )
                 }
                 "/meta/classes" -> {
                     val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
                     val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
-                    val pkg = params["package"] ?: ""
+                    val pkg = when {
+                        params["main_app"]?.toBoolean() == true -> engine.getManifestPackage()
+                        else -> params["package"] ?: ""
+                    }
                     val classes = if (pkg.isNotEmpty()) {
                         engine.getClassNamesByPackage(pkg, offset, count)
                     } else {
                         engine.getAllClassNames(offset, count)
                     }
                     val total = if (pkg.isNotEmpty()) engine.countClassesByPackage(pkg) else engine.classesCount
-                    ResponseUtils.sendSuccess(exchange, mapOf("total" to total, "classes" to classes))
+                    ResponseUtils.sendSuccess(exchange, mapOf("total" to total, "package" to pkg, "classes" to classes))
                 }
                 "/meta/methods" -> {
                     val javaClass = engine.requireClass(params["class_name"])
                     ResponseUtils.sendSuccess(
                         exchange,
-                        mapOf("class_name" to javaClass.fullName, "methods" to javaClass.methods.map { it.name })
+                        mapOf("class_name" to javaClass.fullName, "methods" to engine.methodEntries(javaClass))
                     )
                 }
                 "/meta/fields" -> {
                     val javaClass = engine.requireClass(params["class_name"])
                     ResponseUtils.sendSuccess(
                         exchange,
-                        mapOf("class_name" to javaClass.fullName, "fields" to javaClass.fields.map { it.name })
+                        mapOf("class_name" to javaClass.fullName, "fields" to engine.fieldEntries(javaClass))
                     )
+                }
+                "/meta/components" -> {
+                    val type = params["component_type"] ?: throw DecompileException(
+                        DecompileException.INVALID_ARGUMENT,
+                        "Missing 'component_type'",
+                        400
+                    )
+                    val onlyExported = params["only_exported"]?.toBoolean() ?: false
+                    ResponseUtils.sendSuccess(exchange, engine.getManifestComponents(type, onlyExported))
                 }
                 "/meta/main-activity" -> {
                     val activityClass = engine.getMainActivity()
                     if (activityClass != null) {
                         val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                        val clipped = engine.clipForAgent(engine.getClassSource(activityClass, timeout))
                         ResponseUtils.sendSuccess(
                             exchange,
-                            mapOf(
-                                "class_name" to activityClass.fullName,
-                                "code" to engine.getClassSource(activityClass, timeout)
-                            )
+                            mapOf("class_name" to activityClass.fullName) + clipped
                         )
                     } else {
                         ResponseUtils.sendError(exchange, 404, "Main Activity not found", DecompileException.NOT_FOUND)
@@ -138,17 +155,20 @@ class JadxHttpServer(
                 "/decompile/java" -> {
                     val javaClass = engine.requireClass(params["class_name"])
                     val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    val clipped = engine.clipForAgent(engine.getClassSource(javaClass, timeout))
                     ResponseUtils.sendSuccess(
                         exchange,
-                        mapOf("class_name" to javaClass.fullName, "code" to engine.getClassSource(javaClass, timeout))
+                        mapOf("class_name" to javaClass.fullName) + clipped
                     )
                 }
                 "/decompile/smali" -> {
                     val javaClass = engine.requireClass(params["class_name"])
                     val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    val smali = engine.getClassSmali(javaClass, timeout)
+                    val clipped = engine.clipForAgent(smali)
                     ResponseUtils.sendSuccess(
                         exchange,
-                        mapOf("class_name" to javaClass.fullName, "smali" to engine.getClassSmali(javaClass, timeout))
+                        mapOf("class_name" to javaClass.fullName, "smali" to clipped["code"], "truncated" to clipped["truncated"], "total_chars" to clipped["total_chars"])
                     )
                 }
                 "/decompile/method" -> {
@@ -156,13 +176,10 @@ class JadxHttpServer(
                         ?: throw DecompileException(DecompileException.INVALID_ARGUMENT, "Missing 'method_name'", 400)
                     val javaClass = engine.requireClass(params["class_name"])
                     val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    val clipped = engine.clipForAgent(engine.getMethodSourceCode(javaClass, methodName, timeout))
                     ResponseUtils.sendSuccess(
                         exchange,
-                        mapOf(
-                            "class_name" to javaClass.fullName,
-                            "method_name" to methodName,
-                            "code" to engine.getMethodSourceCode(javaClass, methodName, timeout)
-                        )
+                        mapOf("class_name" to javaClass.fullName, "method_name" to methodName) + clipped
                     )
                 }
                 "/resource/strings" -> {
@@ -173,7 +190,13 @@ class JadxHttpServer(
                 "/resource/list" -> {
                     val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
                     val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
-                    ResponseUtils.sendSuccess(exchange, mapOf("files" to engine.getAllResourceFileNames(offset, count)))
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        mapOf(
+                            "total" to engine.countResources(),
+                            "files" to engine.getAllResourceFileNames(offset, count)
+                        )
+                    )
                 }
                 "/resource/file" -> {
                     val fileName = params["file_name"] ?: ""
@@ -181,6 +204,9 @@ class JadxHttpServer(
                         exchange,
                         mapOf("file_name" to fileName, "content" to engine.getResourceFile(fileName))
                     )
+                }
+                "/resource/id" -> {
+                    ResponseUtils.sendSuccess(exchange, engine.lookupResourceId(params["id"] ?: params["resource_id"] ?: ""))
                 }
                 "/xref/class" -> {
                     val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
@@ -244,9 +270,41 @@ class JadxHttpServer(
                     val methodName = params["method_name"] ?: ""
                     val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
                     val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
+                    val maxScan = params["max_scan"]?.toDoubleOrNull()?.toInt()
                     ResponseUtils.sendSuccess(
                         exchange,
-                        mapOf("matches" to engine.searchMethodByName(methodName, offset, count))
+                        engine.searchMethodByName(methodName, offset, count, params["package"] ?: "", maxScan)
+                    )
+                }
+                "/search/field" -> {
+                    val term = params["search_term"] ?: params["field_name"] ?: ""
+                    val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
+                    val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        engine.searchFieldByName(term, offset, count, params["package"] ?: "")
+                    )
+                }
+                "/search/string" -> {
+                    val term = params["search_term"] ?: ""
+                    val offset = params["offset"]?.toDoubleOrNull()?.toInt() ?: 0
+                    val count = params["count"]?.toDoubleOrNull()?.toInt() ?: 50
+                    val timeout = params["timeout"]?.toDoubleOrNull()?.toLong()
+                    val maxScan = params["max_scan"]?.toDoubleOrNull()?.toInt()
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        engine.searchDexStrings(term, params["package"] ?: "", offset, count, timeout, maxScan)
+                    )
+                }
+                "/rename" -> {
+                    ResponseUtils.sendSuccess(
+                        exchange,
+                        engine.renameSymbol(
+                            params["target_type"] ?: "",
+                            params["class_name"] ?: "",
+                            params["name"] ?: params["old_name"] ?: "",
+                            params["new_name"] ?: ""
+                        )
                     )
                 }
                 else -> ResponseUtils.sendError(exchange, 404, "Unknown endpoint: $path")

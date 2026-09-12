@@ -101,7 +101,11 @@ class MasterKtorServer(
                             return@post
                         }
                         val result = withContext(Dispatchers.IO) {
-                            processManager.loadApk(apkPath, params["max_heap"])
+                            processManager.loadApk(
+                                apkPath,
+                                params["max_heap"],
+                                params["deobf"]?.toBooleanStrictOrNull() ?: true
+                            )
                         }
                         call.respondJson(result)
                     } catch (e: IllegalArgumentException) {
@@ -134,10 +138,12 @@ class MasterKtorServer(
                 // 业务路径：校验 apk_id 后代理到 Worker
                 val businessPaths = listOf(
                     "/meta/manifest", "/meta/summary", "/meta/classes", "/meta/methods", "/meta/fields", "/meta/main-activity",
+                    "/meta/components",
                     "/decompile/java", "/decompile/smali", "/decompile/method",
-                    "/resource/strings", "/resource/list", "/resource/file",
+                    "/resource/strings", "/resource/list", "/resource/file", "/resource/id",
                     "/xref/class", "/xref/method", "/xref/field",
-                    "/search/classes", "/search/method"
+                    "/search/classes", "/search/method", "/search/field", "/search/string",
+                    "/rename"
                 )
                 for (path in businessPaths) {
                     get(path) { proxyBusiness(call) }
